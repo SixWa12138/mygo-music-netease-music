@@ -18,7 +18,7 @@ mygo-music://install-plugin?repo=SixWa12138/mygo-music-netease-music
 
 ## Signing in
 
-Click Sign In in **Settings > Plugins**: NetEase's own page opens, and you scan the code with your phone, or sign in with a phone number and password.
+Click Sign In in **Settings > Plugins**: a QR code shows in the app. Scan it with the NetEase Cloud Music phone app, then confirm on the phone — that's the only way in.
 
 The session cookie (with `MUSIC_U`) is kept unencrypted in the plugin's data on this machine, and is only sent to `music.163.com`. Signing out forgets it. To end the session on NetEase's side, remove this device in the account's security settings.
 
@@ -28,7 +28,7 @@ Signed out:
 
 - Search for songs, albums, artists and playlists, with suggestions while typing
 - Home: today's picks, recommended playlists, new songs, charts
-- Charts, new releases, and the playlist square by category
+- Charts, new releases, and the playlist square's hot playlists
 - Album, artist and playlist pages
 - Playing (128k / 320k; a VIP song is a 45-second preview)
 - Lyrics, with translations when the service has them, and song comments

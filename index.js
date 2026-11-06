@@ -3,9 +3,9 @@
 // website sends it, encrypted with a key made up here once rather than per
 // request, as the service only takes the key back out of the RSA that carried
 // it. A track plays from the address its player is handed, so nothing is
-// converted: the app plays that as it is. A session, signed in on NetEase's own
-// page in a window of the app, is what answers your library, and what makes VIP
-// songs play whole rather than their first 45 seconds.
+// converted: the app plays that as it is. A session, signed in by scanning a
+// code the app shows with the phone, is what answers your library, and what
+// makes VIP songs play whole rather than their first 45 seconds.
 
 const site = "https://music.163.com";
 const webUA =
@@ -203,6 +203,45 @@ async function weapi(path, payload) {
   return check(await res.json(), path);
 }
 
+// The same request, keeping the answer's headers: signing in answers with the
+// session as cookies, and with codes of its own rather than an error.
+async function weapiAnswer(path, payload, session) {
+  const body = new URLSearchParams();
+  body.set("params", paramsOf({ csrf_token: "", ...payload }));
+  body.set("encSecKey", encSecKey);
+  const res = await fetch(`${site}${path}`, {
+    method: "POST",
+    headers: {
+      "user-agent": webUA,
+      referer: `${site}/`,
+      origin: site,
+      cookie: session ? `${session}; ${clientCookie}` : clientCookie,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: body.toString(),
+  });
+  if (!res.ok) throw new Error(`${path}: ${res.status}`);
+  return { res, body: await res.json() };
+}
+
+// The cookies a response sets, by name, as a browser would keep them. The
+// separate lines are read where the runtime keeps them; a response that folds
+// them into one header is taken apart at the commas a cookie starts after.
+function keepCookies(res, jar) {
+  let lines = [];
+  if (typeof res.headers.getSetCookie === "function") lines = res.headers.getSetCookie() || [];
+  if (!lines.length) {
+    lines = String(res.headers.get("set-cookie") || "").split(/,(?=\s*[A-Za-z0-9_-]+=)/);
+  }
+  for (const line of lines) {
+    const pair = String(line).split(";")[0].trim();
+    const at = pair.indexOf("=");
+    if (at > 0) jar[pair.slice(0, at).trim()] = pair.slice(at + 1).trim();
+  }
+}
+
+const cookiesAsHeader = (jar) => Object.entries(jar).map(([name, value]) => `${name}=${value}`).join("; ");
+
 // The other form, eapi, which its apps use for what the website's encryption
 // no longer gets through: AES-ECB once, in hex, with an MD5 of the text
 // inside, and the caller's fields in the payload as `header`.
@@ -358,31 +397,69 @@ export async function account() {
   return current();
 }
 
-// Signing in is on NetEase's own page, in a window of the app, as its website
-// does it: a code scanned from the phone, or a number and a password.
+// Signing in is a code the app draws, which the phone scans: the service hands
+// out a key, the page that carries the key is the code, and the key is asked
+// after until the phone says yes, the answer to that being the session.
 
-const browserUA =
-  host.platform === "darwin"
-    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
-    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
+// A sign-in started again leaves the one before it to stop: its answers would
+// be about a code no dialog shows anymore.
+let signInRun = 0;
+
+const wait = (ms) => new Promise((done) => setTimeout(done, ms));
 
 export async function signIn() {
-  const { cookie: session } = await host.webSignIn({
-    url: `${site}/#/login`,
-    cookiesOf: site,
-    until: ["MUSIC_U"],
-    userAgent: browserUA,
-  });
-  host.storage.set("cookie", session);
-  me = null;
-  meAt = 0;
-  meId = "";
-  const who = await current();
-  if (!who) {
-    endSession();
-    throw new Error("网易云音乐没有接受这次登录，请再试一次。");
+  const run = ++signInRun;
+  host.signInPrompt({ text: "正在获取登录二维码…" });
+  let asked;
+  try {
+    asked = await weapiAnswer("/weapi/login/qrcode/unikey", { type: 1 });
+  } catch (e) {
+    throw fail("signIn", `拿不到登录二维码，请稍后再试：${e.message}`);
   }
-  return who;
+  const key = asked.body.unikey;
+  if (!key) throw fail("signIn", "网易云音乐没有给出二维码，请再试一次。");
+  if (run !== signInRun) return null;
+  const qr = `${site}/login?codekey=${encodeURIComponent(key)}`;
+  host.signInPrompt({ qr, text: "用网易云音乐手机 App 扫描二维码，然后在手机上确认登录。" });
+  const jar = {};
+  keepCookies(asked.res, jar);
+  const deadline = Date.now() + 5 * 60 * 1000;
+  let scanned = false;
+  while (Date.now() < deadline && run === signInRun) {
+    await wait(2000);
+    if (run !== signInRun) return null;
+    let answer;
+    try {
+      answer = await weapiAnswer("/weapi/login/qrcode/client/login", { key, type: 1 }, cookiesAsHeader(jar));
+    } catch (e) {
+      // A poll the network dropped says nothing of the code: the next one asks
+      // after the same key.
+      console.warn(`网易云音乐的登录二维码: ${e.message}`);
+      continue;
+    }
+    keepCookies(answer.res, jar);
+    if (answer.body.code === 800) throw fail("signIn", "二维码已过期，请重新登录。");
+    if (answer.body.code === 802 && !scanned) {
+      scanned = true;
+      host.signInPrompt({ qr, text: "已经扫码，请在手机上确认登录。" });
+    }
+    if (answer.body.code === 803) {
+      const session = cookiesAsHeader(jar);
+      if (!/(^|;\s*)MUSIC_U=/.test(session)) throw fail("signIn", "网易云音乐没有给出登录会话，请重新扫码。");
+      host.storage.set("cookie", session);
+      me = null;
+      meAt = 0;
+      meId = "";
+      const who = await current();
+      if (!who) {
+        endSession();
+        throw new Error("网易云音乐没有接受这次登录，请再试一次。");
+      }
+      return who;
+    }
+  }
+  if (run !== signInRun) return null;
+  throw fail("signIn", "登录超时，请重新扫码。");
 }
 
 export function signOut() {
@@ -446,15 +523,32 @@ async function newSongs() {
     .filter(Boolean);
 }
 
+// A chart can come without a cover, as 荣耀音乐热歌榜 does once signed in: the
+// chart's own page still has one, so that is asked for, and kept a while.
+const chartCovers = new Map();
+
+async function chartCoverOf(id) {
+  const kept = chartCovers.get(id);
+  if (kept && Date.now() - kept.at < 10 * 60 * 1000) return kept.url;
+  const r = await quietly(api("/api/v6/playlist/detail", { id, n: 1 }), null);
+  const url = pictureOf((r && r.playlist && r.playlist.coverImgUrl) || "") || "";
+  chartCovers.set(id, { url, at: Date.now() });
+  return url;
+}
+
 async function chartPlaylists(limit) {
   const r = await api("/api/toplist/detail");
-  return (r.list || []).slice(0, limit).map((l) => ({
+  const charts = (r.list || []).slice(0, limit).map((l) => ({
     id: String(l.id),
     name: l.name || "",
     imageUrl: pictureOf(l.coverImgUrl),
     trackCount: l.trackCount || undefined,
     description: l.updateFrequency || undefined,
   }));
+  for (const chart of charts) {
+    if (!chart.imageUrl) chart.imageUrl = await chartCoverOf(chart.id);
+  }
+  return charts;
 }
 
 async function newAlbums(limit) {
@@ -482,24 +576,15 @@ export async function browse({ page }) {
     const songs = await dailySongs();
     return { title: cookie() ? "每日推荐" : "今日推荐", subtitle: "今天为你挑的歌", sections: [{ tracks: songs }] };
   }
-  if (page === "playlists" || page.startsWith("playlists:")) {
-    const at = page.indexOf(":");
-    return playlistSquare(at < 0 ? "全部" : page.slice(at + 1));
-  }
+  if (page === "playlists") return playlistSquare();
   throw fail("unavailable", `没有这个页面：${page}`);
 }
 
-const categories = ["全部", "华语", "欧美", "日语", "韩语", "粤语", "流行", "摇滚", "民谣", "电子", "说唱", "轻音乐", "爵士", "古典", "影视原声", "二次元", "怀旧", "治愈"];
-
-async function playlistSquare(category) {
-  const r = await api("/api/playlist/list", { cat: category, order: "hot", limit: 30, offset: 0 });
-  const playlists = (r.playlists || []).map(playlistOf);
+async function playlistSquare() {
+  const r = await api("/api/playlist/list", { cat: "全部", order: "hot", limit: 30, offset: 0 });
   return {
-    title: category === "全部" ? "歌单广场" : `${category}歌单`,
-    sections: [
-      { title: "分类", links: categories.map((name) => ({ title: name, page: `playlists:${name}` })) },
-      { title: category === "全部" ? "热门歌单" : `热门${category}歌单`, playlists },
-    ],
+    title: "歌单广场",
+    sections: [{ title: "热门歌单", playlists: (r.playlists || []).map(playlistOf) }],
   };
 }
 

@@ -1,7 +1,7 @@
 {
   "id": "netease-music",
   "name": "网易云音乐",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "main": "index.js",
   "playback": "stream",
   "permissions": {
