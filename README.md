@@ -4,7 +4,7 @@ English | [中文](README_ZH.md)
 
 Plays NetEase Cloud Music in [MyGo Music](https://github.com/egoist/mygo-music): search, playlists, albums, artists, charts, the daily mix, lyrics, comments and your library.
 
-It isn't affiliated with or endorsed by NetEase. It uses the private API of the website, which NetEase may change at any time; when it does, the plugin has to change too. Read the copyright and disclaimer at the end before using it.
+It isn't affiliated with or endorsed by NetEase. It uses the private APIs of the website and client, which NetEase may change at any time; when it does, the plugin has to change too. Read the copyright and disclaimer at the end before using it.
 
 ![MyGo Music home with the NetEase Cloud Music plugin](screenshots/mygo-music-home.png)
 
@@ -22,7 +22,7 @@ mygo-music://install-plugin?repo=SixWa12138/mygo-music-netease-music
 
 Click Sign In in **Settings > Plugins**: a QR code shows in the app. Scan it with the NetEase Cloud Music phone app, then confirm on the phone — that's the only way in.
 
-The session cookie (with `MUSIC_U`) is kept unencrypted in the plugin's data on this machine, and is only sent to `music.163.com`. Signing out forgets it. To end the session on NetEase's side, remove this device in the account's security settings.
+The session cookie (with `MUSIC_U`) is kept unencrypted in the plugin's data on this machine, and is only sent to NetEase's `music.163.com` and `interfacepc.music.163.com`, never to the audio CDN. Signing out forgets it. To end the session on NetEase's side, remove this device in the account's security settings.
 
 ## What works
 
@@ -32,6 +32,7 @@ Signed out:
 - Home: today's picks, recommended playlists, new songs, charts
 - Charts, new releases, and the playlist square's hot playlists
 - Album, artist and playlist pages
+- Podcast recommendations, popular shows, search, episodes and playback
 - Playing (128k / 320k; a VIP song is a 45-second preview)
 - Lyrics, with translations when the service has them, and song comments
 - A station of songs similar to the last one
@@ -39,25 +40,46 @@ Signed out:
 Signed in:
 
 - Your playlists, liked songs, recently played, saved albums
+- Playing songs in your playlists that you uploaded to your personal cloud
+- Podcast library tabs: subscribed, created, purchased, and liked voices; subscribing and unsubscribing
+- A paged music cloud library, local file uploads, batch progress and cancellation, with refresh after upload
 - The daily mix, and personal radio
 - Liking and unliking, posting comments, liking comments
 - Creating, renaming and deleting playlists, adding and removing songs, reordering them
 - Saving playlists, saving albums, following artists
 - Lossless (flac) when the account has it
 
-Not done: podcasts, videos, the cloud drive, listening together, the feed.
+Not done: videos, bulk cloud deletion, creating or purchasing new podcasts, listening together, the feed.
 
 Plays are not reported back to NetEase, so its own listening charts don't move. The plugin keeps its own recent list of what was played on this machine.
 
+## Sidebar layout
+
+Discovery, charts, new releases, playlists, podcasts and radio appear above a divider. Liked songs, saved albums, subscribed podcasts and the music cloud follow the divider, with the created and saved playlist groups and their lists beneath those navigation entries.
+
+MyGo Music 0.1.13 originally has no plugin support for dividers or positioning playlist groups. The [host sidebar patch](patches/mygo-sidebar.patch) adds this support; the local build is `0.1.13+sidebar.2`. The stock player can still open the new pages, but the full grouping and order require the patch, which may need reapplying after a player update.
+
+The companion build also includes a [dynamic liked cover patch](patches/mygo-liked-cover.patch). Liked Songs uses the first song's album artwork and updates after successful likes or unlikes in this app. Empty lists and missing, loading or failed artwork show the heart placeholder.
+
+## Cloud uploads and podcast tabs
+
+Plugin 0.4.0 needs the [cloud library host patch](patches/mygo-cloud-library.patch) for its four podcast tabs and upload controls. The local build is `0.1.13+cloud.1`, retaining the sidebar and dynamic liked-cover patches.
+
+Upload Music accepts multiple MP3, AAC, WMA, WAV, OGG, M4A, APE, FLAC and CUE files. CUE sheets (including `.flac.cue`) split at TRACK / INDEX 01 boundaries. Each track is uploaded as a temporary FLAC with its title, artist, album and track number, then the temporary file is removed. Duplicate selections of the same track are deduplicated. References stay within the sheet's directory; choose audio elsewhere directly.
+
+Uploads preserve the original bytes, show per-file progress, support cancellation, and report failures. Playback of M4A, AAC, WMA, WAV and APE uses FFmpeg from PATH to create a temporary FLAC after the full download; the temporary files are removed on close. FFmpeg is already installed on this machine.
+
 ## Sound
 
-A track plays from the address the service hands out, with nothing converted: mp3 or flac as it is.
+Playback addresses come from `interfacepc.music.163.com/eapi/song/enhance/player/url/v1`, the same official client API used by [sogud/mygo-music-netease](https://github.com/sogud/mygo-music-netease). No separate API service is needed. A track plays from the returned NetEase CDN address, with nothing converted: mp3 or flac as it is.
 
 - standard: 128 kbps
 - high: 320 kbps
 - lossless: flac (with membership)
 
 Signed out, or without membership, a VIP track comes back as a 45-second fragment. That's the service's own doing, not the plugin cutting it off.
+
+If the primary playback endpoint fails or returns no playable address, the plugin tries the same official client's `/eapi/song/enhance/player/url` endpoint. Public catalog restrictions do not grey out your uploaded cloud copy; its audio quality depends on the file NetEase returns.
 
 ## Lyrics
 
@@ -67,8 +89,8 @@ NetEase's own LRC, together with the translation (`tlyric`) when there is one. T
 
 The website and the desktop app encrypt their requests in two different ways, and the plugin has to speak both:
 
-- `weapi`: liking, comments, saving albums, following artists, creating and deleting playlists, reordering their tracks, recently played, the daily mix. AES-128-CBC twice, with the key wrapped in RSA.
-- `eapi`: the ids of liked songs, saving a playlist, renaming a playlist, adding and removing its songs. AES-128-ECB once, with an MD5 inside the text, and some header fields the app sends.
+- `weapi`: comments, saving albums, following artists, creating and deleting playlists, reordering their tracks, recently played, the daily mix. AES-128-CBC twice, with the key wrapped in RSA.
+- `eapi`: liking and unliking, the ids of liked songs, playback addresses, saving a playlist, renaming a playlist, adding and removing its songs, all through `interfacepc.music.163.com`. AES-128-ECB once, with an MD5 inside the text and login credentials in both the encrypted header and Cookie.
 
 The plugin's runtime has MD5 and AES-ECB (`host.crypto`) but no AES-CBC, so `index.js` carries a small AES-128-CBC of its own; the S-box is computed over the field rather than typed out. The RSA key is fixed, so its result is worked out once and kept as the constant `encSecKey`: the service only cares that it can recover the key, not that it's a new one every time.
 
@@ -76,11 +98,15 @@ The `X-antiCheatToken` in `eapi` is a constant from the client, and may change w
 
 ## Known limits
 
-- Both the endpoints and the encryption are private to the website; a change at NetEase can break the plugin.
+- Both the endpoints and the encryption are private to NetEase; a change can break the plugin. Temporary environment or network risk errors require trying again later.
 - Personal radio, your library, saving and commenting need a session; the daily mix is only yours when signed in.
 - Regional licensing still applies: some songs are unplayable from some networks.
 - A playlist over a thousand songs costs one more request when it opens, so it opens a little slower.
 - Saving a playlist goes through `eapi` and the anti-cheat token, which a new client version can invalidate.
+
+## Development checks
+
+No build or dependency installation is needed. With Node.js 22 or newer, run `node --check index.js` and `node --test index.test.mjs`. The tests mock the API and do not read your local session.
 
 ## Copyright and disclaimer
 
@@ -94,7 +120,7 @@ The `X-antiCheatToken` in `eapi` is a constant from the client, and may change w
 
 **Scope of use.** For personal study, research and private use only. Do not use the plugin, or a modified version of it, commercially, as a public service, for bulk scraping, for hoarding data, for redistribution, or in any way that breaks NetEase's terms of service or the laws where you live. You are responsible for what you do with it.
 
-**Account and privacy.** The plugin collects nothing and uploads nothing. The session cookie is kept in plain text in the plugin's data folder on your own machine, and is only sent to `music.163.com`; signing out deletes it. Keep your computer and your account safe yourself.
+**Account and privacy.** The plugin collects no analytics. Cloud uploads send only the audio files you select, or their CUE tracks, to NetEase's official `*.127.net` upload service; that service does not receive your session cookie. The cookie is kept in plain text in the plugin's data folder on your own machine, and is only sent to NetEase's `music.163.com` and `interfacepc.music.163.com`; signing out deletes it. Keep your computer and your account safe yourself.
 
 **License.** The plugin's code is shared for personal study, research and private use; no other license is granted. To republish it, distribute a modified version, or use it commercially, ask the author first.
 

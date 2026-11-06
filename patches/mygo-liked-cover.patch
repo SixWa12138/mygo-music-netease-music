@@ -1,0 +1,104 @@
+diff --git a/internal/app/ui_pages.go b/internal/app/ui_pages.go
+index 22555c0..aa206db 100644
+--- a/internal/app/ui_pages.go
++++ b/internal/app/ui_pages.go
+@@ -335,9 +335,19 @@ func (a *app) likedPage(c *ui.Context) {
+ 	header := func(c *ui.Context) {
+ 		p := a.pal
+ 		ui.Row(c).Gap(28).AlignItems(ui.End).Padding(0, 0, 26, 0).Children(func() {
+-			ui.Box(c).Size(212, 212).Radius(14).Center().Shadow(0, 18, 40, -10, p.cardShade).TextColor(white).
+-				LinearGradient(ui.LinearGradient{Angle: 135, Oklab: true, From: ui.Oklch(0.72, 0.17, 10), To: ui.Oklch(0.58, 0.22, 350)}).
+-				Children(func() { ui.Icon(c, iconHeartFill).Size(84, 84) })
++			var bmp *ui.Bitmap
++			if len(lib.likedList) > 0 {
++				bmp = bitmap(a.art.get(sized(lib.likedList[0].Album.ImageURL, 600), false))
++			}
++			cover := ui.Box(c).Size(212, 212).Radius(14).Center().Shadow(0, 18, 40, -10, p.cardShade).TextColor(white).
++				LinearGradient(ui.LinearGradient{Angle: 135, Oklab: true, From: ui.Oklch(0.72, 0.17, 10), To: ui.Oklch(0.58, 0.22, 350)})
++			in := artIn(cover, bmp)
++			cover.Children(func() {
++				if in < 1 {
++					ui.Icon(c, iconHeartFill).Size(84, 84).Opacity(1 - in)
++				}
++				artImage(c, bmp, 14, in)
++			})
+ 			ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(8).Children(func() {
+ 				ui.Text(c, T("Playlist")).FontSize(12).FontWeight(600).TextColor(p.accent)
+ 				ui.Text(c, T("Liked Songs")).FontSize(30).FontWeight(800).LetterSpacing(-0.6)
+diff --git a/internal/app/liked_cover_test.go b/internal/app/liked_cover_test.go
+new file mode 100644
+index 0000000..da4b0cf
+--- /dev/null
++++ b/internal/app/liked_cover_test.go
+@@ -0,0 +1,71 @@
++package app
++
++import (
++	"errors"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/music"
++)
++
++// The liked page used a fixed heart; its cover must follow the first song after successful likes and unlikes.
++func TestLikedCoverFollowsFirstSong(t *testing.T) {
++	a := newTestApp()
++	ch := posts(a)
++	tracks := framesTracks(a)[:3]
++	// Give the header its own cache entry, distinct from the song rows.
++	for _, tr := range tracks {
++		key := sized(tr.Album.ImageURL, 600)
++		art := *a.art.art[key]
++		a.art.art[key] = &art
++	}
++	a.account = &music.Account{ID: "1"}
++	fake(a).liked = func(int) (*music.Page, error) {
++		return &music.Page{Tracks: []music.Track{tracks[1], tracks[0]}}, nil
++	}
++	a.loadLikedPage(a.library)
++	runPost(t, ch)
++	a.route = route{page: pageLiked, src: "fake"}
++	now := time.Unix(1, 0)
++	a.art.now = func() time.Time { return now }
++	tt := ui.NewTester(a.view, 1180, 780)
++	check := func(name, url string) {
++		t.Helper()
++		now = now.Add(time.Second)
++		settled(tt)
++		for _, tr := range tracks {
++			used := a.art.art[sized(tr.Album.ImageURL, 600)].used.Equal(now)
++			if used != (tr.Album.ImageURL == url) {
++				t.Fatalf("%s: header used %q = %v, want %q", name, tr.Album.ImageURL, used, url)
++			}
++		}
++		if dir := os.Getenv("MM_FRAMES"); dir != "" {
++			saveFrame(t, dir, "liked-"+name+".png", tt.Image())
++		}
++	}
++	check("loaded", tracks[1].Album.ImageURL)
++	a.toggleLike(&tracks[2])
++	runPost(t, ch)
++	check("added", tracks[2].Album.ImageURL)
++	fake(a).like = func(string, bool) error { return errors.New("offline") }
++	a.toggleLike(&tracks[2])
++	runPost(t, ch)
++	check("rejected", tracks[2].Album.ImageURL)
++	fake(a).like = nil
++	for _, i := range []int{2, 1} {
++		a.toggleLike(&tracks[i])
++		runPost(t, ch)
++		check("removed-"+tracks[i].ID, tracks[i-1].Album.ImageURL)
++	}
++	missing := song("missing", "No artwork")
++	a.toggleLike(&missing)
++	runPost(t, ch)
++	check("missing", "")
++	a.toggleLike(&missing)
++	runPost(t, ch)
++	a.toggleLike(&tracks[0])
++	runPost(t, ch)
++	check("empty", "")
++}

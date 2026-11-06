@@ -1,0 +1,221 @@
+diff --git a/internal/app/icons.go b/internal/app/icons.go
+index 381f915..5e34c02 100644
+--- a/internal/app/icons.go
++++ b/internal/app/icons.go
+@@ -43,6 +43,7 @@ var (
+ 	iconHeartFill = fillIcon(`<path d="M19 14c1.5-1.5 3-3.2 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.8 0-3 .5-4.5 2-1.5-1.5-2.7-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4 3 5.5l7 7z"/>`)
+ 	iconUser      = strokeIcon(`<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>`)
+ 	iconPodcast   = strokeIcon(`<rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><path d="M12 18v4"/>`)
++	iconCloud     = strokeIcon(`<path d="M6.5 19h11a4.5 4.5 0 0 0 .5-9 6 6 0 0 0-11.6-1.5A5.3 5.3 0 0 0 6.5 19Z"/>`)
+ )
+ 
+ var (
+@@ -75,6 +76,8 @@ func navIcon(name string) *ui.SVG {
+ 		return iconRadio
+ 	case "podcast":
+ 		return iconPodcast
++	case "cloud":
++		return iconCloud
+ 	case "chart":
+ 		return iconCharts
+ 	case "calendar":
+diff --git a/internal/app/sidebar_test.go b/internal/app/sidebar_test.go
+index 17540fa..f3a2863 100644
+--- a/internal/app/sidebar_test.go
++++ b/internal/app/sidebar_test.go
+@@ -78,3 +78,48 @@ func TestNewPlaylistInCollapsedSidebar(t *testing.T) {
+ 		t.Error("the plus also toggled a playlist section")
+ 	}
+ }
++
++// Positioned playlist groups still collapse and navigate, and a following podcast tab remains reachable.
++func TestPositionedSidebarGroups(t *testing.T) {
++	a := editTestApp()
++	f := fake(a)
++	f.caps["shows"] = true
++	a.library.caps = probeCaps(f)
++	f.info.Navigation = []music.NavItem{
++		{Builtin: "home"},
++		{Builtin: "separator"},
++		{Builtin: "liked"},
++		{Builtin: "myPlaylists", Title: "Created"},
++		{Builtin: "savedPlaylists", Title: "Saved"},
++		{Builtin: "shows", Title: "My Podcasts"},
++	}
++	a.playlists["20"] = &music.Playlist{ID: "20", Name: "飙升榜"}
++	tt := ui.NewTester(a.view, 1200, 1000)
++	tt.Frame()
++	if err := tt.Click("Saved"); err != nil {
++		t.Fatal(err)
++	}
++	tt.Frame()
++	if _, ok := tt.Find("飙升榜"); ok {
++		t.Fatal("the collapsed group still exposes its playlist")
++	}
++	if _, ok := tt.Find("Saved Playlists"); ok {
++		t.Fatal("the automatic group duplicated the positioned group")
++	}
++	if err := tt.Click("Saved"); err != nil {
++		t.Fatal(err)
++	}
++	tt.Frame()
++	if err := tt.Click("飙升榜"); err != nil {
++		t.Fatal(err)
++	}
++	if a.route.page != pagePlaylist || a.route.id != "20" {
++		t.Fatalf("opened %+v", a.route)
++	}
++	if err := tt.Click("My Podcasts"); err != nil {
++		t.Fatal(err)
++	}
++	if a.route.page != pageShows {
++		t.Fatalf("opened %+v", a.route)
++	}
++}
+diff --git a/internal/app/ui_main.go b/internal/app/ui_main.go
+index efc43c9..3c5bacd 100644
+--- a/internal/app/ui_main.go
++++ b/internal/app/ui_main.go
+@@ -216,15 +216,31 @@ func (a *app) sidebar(c *ui.Context) {
+ 		}
+ 
+ 		ui.Scroll(c.Key("nav")).TrackScroll(&a.navScroll).Grow(1).Margin(0, -6).Padding(0, 6).Gap(4).Children(func() {
++			minePlaced, savedPlaced := false, false
+ 			for _, n := range a.sidebarItems() {
+-				a.navItem(c, n.icon, n.label, n.route)
++				switch n.builtin {
++				case "separator":
++					ui.Box(c).Height(1).Margin(12, 10).Background(a.pal.hairline)
++				case "myPlaylists":
++					a.myPlaylists(c, n.label, a.mine, true, &a.mineCollapsed)
++					minePlaced = true
++				case "savedPlaylists":
++					a.myPlaylists(c, n.label, a.saved, false, &a.savedCollapsed)
++					savedPlaced = true
++				default:
++					a.navItem(c, n.icon, n.label, n.route)
++				}
+ 			}
+ 			if a.searched.query != "" && a.searched.src == a.id {
+ 				a.navItem(c, iconSearch, T("Search Results"), a.searched)
+ 			}
+ 			if a.can("playlists") {
+-				a.myPlaylists(c, T("My Playlists"), a.mine, true, &a.mineCollapsed)
+-				a.myPlaylists(c, T("Saved Playlists"), a.saved, false, &a.savedCollapsed)
++				if !minePlaced {
++					a.myPlaylists(c, T("My Playlists"), a.mine, true, &a.mineCollapsed)
++				}
++				if !savedPlaced {
++					a.myPlaylists(c, T("Saved Playlists"), a.saved, false, &a.savedCollapsed)
++				}
+ 			}
+ 		})
+ 
+@@ -518,9 +534,10 @@ func firstPlayable(tracks []music.Track) int {
+ 
+ // sidebarItem is an entry of the sidebar.
+ type sidebarItem struct {
+-	icon  *ui.SVG
+-	label string
+-	route route
++	icon    *ui.SVG
++	label   string
++	route   route
++	builtin string
+ }
+ 
+ // builtinPages are the app's pages a source's sidebar can have, each with what
+@@ -549,9 +566,26 @@ func (a *app) sidebarItems() []sidebarItem {
+ 		}
+ 	}
+ 	for _, n := range nav {
++		if n.Builtin == "separator" {
++			items = append(items, sidebarItem{builtin: n.Builtin})
++			continue
++		}
++		if n.Builtin == "myPlaylists" || n.Builtin == "savedPlaylists" {
++			if a.can("playlists") {
++				label := n.Title
++				if label == "" {
++					label = T("My Playlists")
++					if n.Builtin == "savedPlaylists" {
++						label = T("Saved Playlists")
++					}
++				}
++				items = append(items, sidebarItem{label: label, builtin: n.Builtin})
++			}
++			continue
++		}
+ 		if n.Builtin == "" {
+ 			if a.can("browse") {
+-				items = append(items, sidebarItem{navIcon(n.Icon), n.Title, route{page: pageBrowse, id: n.Page}})
++				items = append(items, sidebarItem{icon: navIcon(n.Icon), label: n.Title, route: route{page: pageBrowse, id: n.Page}})
+ 			}
+ 			continue
+ 		}
+@@ -559,7 +593,7 @@ func (a *app) sidebarItems() []sidebarItem {
+ 		if !ok || b.needs != "" && !a.can(b.needs) {
+ 			continue
+ 		}
+-		item := sidebarItem{b.icon(), n.Title, route{page: b.page}}
++		item := sidebarItem{icon: b.icon(), label: n.Title, route: route{page: b.page}}
+ 		if item.label == "" {
+ 			item.label = T(b.label)
+ 		}
+diff --git a/internal/music/music.go b/internal/music/music.go
+index 30a09e8..47d9d08 100644
+--- a/internal/music/music.go
++++ b/internal/music/music.go
+@@ -212,11 +212,11 @@ type Link struct {
+ type NavItem struct {
+ 	Title string `json:"title"`
+ 	Page  string `json:"page,omitempty"`
+-	// Builtin is home, liked, savedAlbums, stations or shows. One the source
+-	// can't do doesn't show.
++	// Builtin is home, liked, savedAlbums, stations, shows, separator,
++	// myPlaylists or savedPlaylists. One the source can't do doesn't show.
+ 	Builtin string `json:"builtin,omitempty"`
+ 	// Icon names one of the app's: home, note, album, artist, playlist, radio,
+-	// podcast, chart, calendar, heart, search or star.
++	// podcast, cloud, chart, calendar, heart, search or star.
+ 	Icon string `json:"icon,omitempty"`
+ }
+ 
+diff --git a/internal/app/navigation_frame_test.go b/internal/app/navigation_frame_test.go
+new file mode 100644
+index 0000000..4cbecbb
+--- /dev/null
++++ b/internal/app/navigation_frame_test.go
+@@ -0,0 +1,32 @@
++package app
++
++import (
++	"encoding/json"
++	"os"
++	"testing"
++
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/music"
++)
++
++// With a plugin manifest and MM_FRAMES set, saves its complete sidebar for visual review.
++func TestPluginSidebarFrame(t *testing.T) {
++	dir := framesDir(t)
++	manifest, err := os.ReadFile(os.Getenv("MM_NAV_MANIFEST"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	var info music.Info
++	if err := json.Unmarshal(manifest, &info); err != nil {
++		t.Fatal(err)
++	}
++	a := editTestApp()
++	f := fake(a)
++	f.info.Navigation = info.Navigation
++	f.caps["browse"], f.caps["shows"], f.caps["stations"] = true, true, true
++	a.library.caps = probeCaps(f)
++	a.mineCollapsed, a.savedCollapsed = true, true
++	tt := ui.NewTester(a.view, 1180, 880)
++	settled(tt)
++	saveFrame(t, dir, "netease-sidebar-preview.png", tt.Image())
++}

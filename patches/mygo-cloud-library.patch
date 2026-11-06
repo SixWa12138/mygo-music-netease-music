@@ -1,0 +1,1451 @@
+diff --git a/internal/music/music.go b/internal/music/music.go
+index 47d9d08..ea5a4a8 100644
+--- a/internal/music/music.go
++++ b/internal/music/music.go
+@@ -4,6 +4,7 @@
+ package music
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"strings"
+ 	"time"
+@@ -179,9 +180,23 @@ type CommentPage struct {
+ // Browse is a page a source makes up itself, of sections it chooses: what its
+ // Home shows, and any other opened from a Link, a MorePage or its Navigation.
+ type Browse struct {
+-	Title    string    `json:"title,omitempty"`
+-	Subtitle string    `json:"subtitle,omitempty"`
+-	Sections []Section `json:"sections,omitempty"`
++	Title          string      `json:"title,omitempty"`
++	Subtitle       string      `json:"subtitle,omitempty"`
++	Sections       []Section   `json:"sections,omitempty"`
++	Tabs           []BrowseTab `json:"tabs,omitempty"`
++	NavigationPage string      `json:"navigationPage,omitempty"`
++	Upload         bool        `json:"upload,omitempty"`
++}
++
++type BrowseTab struct {
++	Title    string `json:"title"`
++	Page     string `json:"page"`
++	Selected bool   `json:"selected,omitempty"`
++}
++
++// Uploader receives only paths explicitly selected in the native file picker.
++type Uploader interface {
++	Upload(context.Context, string, func(sent, total int64)) error
+ }
+ 
+ // Section is a heading over what it lists. A section may hold several kinds,
+diff --git a/internal/music/upload.go b/internal/music/upload.go
+new file mode 100644
+index 0000000..49abfc8
+--- /dev/null
++++ b/internal/music/upload.go
+@@ -0,0 +1,219 @@
++package music
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"fmt"
++	"mygo-music/internal/i18n"
++	"os"
++	"path/filepath"
++	"regexp"
++	"slices"
++	"strconv"
++	"strings"
++	"unicode/utf8"
++
++	"golang.org/x/text/encoding/simplifiedchinese"
++	"golang.org/x/text/encoding/unicode"
++)
++
++var UploadExtensions = []string{"mp3", "aac", "wma", "wav", "ogg", "m4a", "ape", "flac", "cue"}
++
++func IsUploadAudio(path string) bool {
++	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(path)), ".")
++	return ext != "cue" && slices.Contains(UploadExtensions, ext)
++}
++
++// A cue interval is in CD frames (75 per second); Until -1 means the file's end.
++type UploadSelection struct {
++	Path, Name, Title, Artist, Album string
++	From, Until                      int64
++	Number                           int
++	Cue                              bool
++}
++
++func ResolveUploadFiles(paths []string) ([]UploadSelection, error) {
++	var out []UploadSelection
++	seen := map[string]bool{}
++	for _, path := range paths {
++		resolved, err := filepath.EvalSymlinks(path)
++		if err != nil {
++			return nil, err
++		}
++		var entries []UploadSelection
++		if strings.EqualFold(filepath.Ext(path), ".cue") {
++			entries, err = readCue(resolved)
++			if err != nil {
++				return nil, err
++			}
++		} else {
++			if !IsUploadAudio(path) {
++				return nil, fmt.Errorf(i18n.T("Unsupported audio file: %s"), filepath.Base(path))
++			}
++			entries = []UploadSelection{{Path: resolved, Name: filepath.Base(path), Until: -1}}
++		}
++		for _, entry := range entries {
++			key := fmt.Sprintf("%s:%t:%d:%d", entry.Path, entry.Cue, entry.From, entry.Until)
++			if !seen[key] {
++				seen[key] = true
++				out = append(out, entry)
++			}
++		}
++	}
++	return out, nil
++}
++
++var cueField = regexp.MustCompile(`(?i)^(FILE|TRACK|TITLE|PERFORMER|INDEX)\s+(.*)$`)
++var cueFilename = regexp.MustCompile(`^(?:"([^"]+)"|(\S+))\s+\S+\s*$`)
++var unsafeFilename = regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
++
++func readCue(path string) ([]UploadSelection, error) {
++	stat, err := os.Stat(path)
++	if err != nil {
++		return nil, err
++	}
++	if !stat.Mode().IsRegular() || stat.Size() > 1<<20 {
++		return nil, errors.New(i18n.T("Invalid or oversized CUE sheet"))
++	}
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return nil, err
++	}
++	switch {
++	case bytes.HasPrefix(data, []byte{0xff, 0xfe}):
++		data, err = unicode.UTF16(unicode.LittleEndian, unicode.ExpectBOM).NewDecoder().Bytes(data)
++	case bytes.HasPrefix(data, []byte{0xfe, 0xff}):
++		data, err = unicode.UTF16(unicode.BigEndian, unicode.ExpectBOM).NewDecoder().Bytes(data)
++	case !utf8.Valid(data):
++		data, err = simplifiedchinese.GB18030.NewDecoder().Bytes(data)
++	}
++	if err != nil {
++		return nil, err
++	}
++	var entries []UploadSelection
++	var audio, album, artist string
++	current := -1
++	for _, line := range strings.Split(strings.TrimPrefix(string(data), "\ufeff"), "\n") {
++		fields := cueField.FindStringSubmatch(strings.TrimSpace(line))
++		if fields == nil {
++			continue
++		}
++		value := strings.TrimSpace(fields[2])
++		switch strings.ToUpper(fields[1]) {
++		case "FILE":
++			parts := cueFilename.FindStringSubmatch(value)
++			if parts == nil {
++				return nil, errors.New(i18n.T("Invalid CUE FILE entry"))
++			}
++			name := parts[1]
++			if name == "" {
++				name = parts[2]
++			}
++			name = strings.ReplaceAll(name, `\`, "/")
++			if !filepath.IsLocal(name) || strings.Contains(name, ":") {
++				return nil, errors.New(i18n.T("CUE references must stay within its folder"))
++			}
++			audio, err = filepath.EvalSymlinks(filepath.Join(filepath.Dir(path), filepath.FromSlash(name)))
++			if err != nil {
++				return nil, err
++			}
++			relative, err := filepath.Rel(filepath.Dir(path), audio)
++			if err != nil || !filepath.IsLocal(relative) {
++				return nil, errors.New(i18n.T("CUE references must stay within its folder"))
++			}
++			if !IsUploadAudio(audio) {
++				return nil, errors.New(i18n.T("CUE references an unsupported audio file"))
++			}
++			current = -1
++		case "TRACK":
++			parts := strings.Fields(value)
++			if len(parts) != 2 || !strings.EqualFold(parts[1], "AUDIO") || audio == "" {
++				return nil, errors.New(i18n.T("CUE requires AUDIO tracks and a FILE entry"))
++			}
++			number, err := strconv.Atoi(parts[0])
++			if err != nil || number <= 0 {
++				return nil, errors.New(i18n.T("Invalid CUE track number"))
++			}
++			entries = append(entries, UploadSelection{Path: audio, Number: number, From: -1, Until: -1, Cue: true, Album: album, Artist: artist})
++			current = len(entries) - 1
++		case "TITLE":
++			value = strings.Trim(value, `"`)
++			if current < 0 {
++				album = value
++			} else {
++				entries[current].Title = value
++			}
++		case "PERFORMER":
++			value = strings.Trim(value, `"`)
++			if current < 0 {
++				artist = value
++			} else {
++				entries[current].Artist = value
++			}
++		case "INDEX":
++			parts := strings.Fields(value)
++			if len(parts) != 2 || parts[0] != "01" {
++				continue
++			}
++			if current < 0 {
++				return nil, errors.New(i18n.T("CUE INDEX has no track"))
++			}
++			timeParts := strings.Split(parts[1], ":")
++			if len(timeParts) != 3 {
++				return nil, errors.New(i18n.T("Invalid CUE track time"))
++			}
++			minute, e1 := strconv.ParseInt(timeParts[0], 10, 64)
++			second, e2 := strconv.ParseInt(timeParts[1], 10, 64)
++			frame, e3 := strconv.ParseInt(timeParts[2], 10, 64)
++			if e1 != nil || e2 != nil || e3 != nil || minute < 0 || minute > 100000 || second < 0 || second > 59 || frame < 0 || frame > 74 {
++				return nil, errors.New(i18n.T("Invalid CUE track time"))
++			}
++			entries[current].From = (minute*60+second)*75 + frame
++		}
++	}
++	if len(entries) == 0 {
++		return nil, errors.New(i18n.T("CUE sheet has no audio tracks"))
++	}
++	for i := range entries {
++		entry := &entries[i]
++		if entry.From < 0 {
++			return nil, errors.New(i18n.T("CUE track is missing INDEX 01"))
++		}
++		if i+1 < len(entries) && entries[i+1].Path == entry.Path {
++			entry.Until = entries[i+1].From
++			if entry.Until <= entry.From {
++				return nil, errors.New(i18n.T("CUE track times must increase"))
++			}
++		}
++		if entry.Title == "" {
++			entry.Title = fmt.Sprintf("Track %02d", entry.Number)
++		}
++		title := []rune(unsafeFilename.ReplaceAllString(entry.Title, "_"))
++		if len(title) > 100 {
++			title = title[:100]
++		}
++		entry.Name = fmt.Sprintf("%02d %s.flac", entry.Number, string(title))
++	}
++	return entries, nil
++}
++
++// PrepareUploadFile losslessly cuts a CUE track and tags it; callers remove it after that upload.
++func PrepareUploadFile(ctx context.Context, entry UploadSelection) (string, func(), error) {
++	noop := func() {}
++	if !entry.Cue {
++		return entry.Path, noop, nil
++	}
++	dir, err := os.MkdirTemp("", "mygo-cue-")
++	if err != nil {
++		return "", noop, err
++	}
++	cleanup := func() { os.RemoveAll(dir) }
++	output := filepath.Join(dir, entry.Name)
++	err = ConvertToFLAC(ctx, entry.Path, output, entry.From, entry.Until, map[string]string{"title": entry.Title, "artist": entry.Artist, "album": entry.Album, "track": strconv.Itoa(entry.Number)})
++	if err != nil {
++		cleanup()
++		return "", noop, err
++	}
++	return output, cleanup, nil
++}
+diff --git a/internal/music/upload_test.go b/internal/music/upload_test.go
+new file mode 100644
+index 0000000..8bb8cf5
+--- /dev/null
++++ b/internal/music/upload_test.go
+@@ -0,0 +1,67 @@
++package music
++
++import (
++	"golang.org/x/text/encoding/simplifiedchinese"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// CUE tracks retain metadata and precise boundaries without uploading the index or unrelated files.
++func TestCueUploadSelection(t *testing.T) {
++	dir := t.TempDir()
++	audio := filepath.Join(dir, "整轨.flac")
++	cue := filepath.Join(dir, "整轨.flac.cue")
++	os.WriteFile(audio, []byte("audio"), 0600)
++	content := `PERFORMER "Artist"
++TITLE "Album"
++FILE "整轨.flac" WAVE
++ TRACK 01 AUDIO
++ TITLE "第一首"
++ INDEX 01 00:00:00
++ TRACK 02 AUDIO
++ TITLE "第二首"
++ PERFORMER "Guest"
++ INDEX 01 01:02:37
++`
++	for _, gbk := range []bool{false, true} {
++		data := []byte(content)
++		if gbk {
++			data, _ = simplifiedchinese.GB18030.NewEncoder().Bytes(data)
++		}
++		os.WriteFile(cue, data, 0600)
++		files, err := ResolveUploadFiles([]string{cue, cue})
++		if err != nil || len(files) != 2 {
++			t.Fatalf("got %v, %v", files, err)
++		}
++		if files[0].Path != audio || files[0].Title != "第一首" || files[0].Album != "Album" || files[0].Until != 4687 || files[1].From != 4687 || files[1].Until != -1 || files[1].Artist != "Guest" {
++			t.Fatalf("wrong cue tracks: %+v", files)
++		}
++	}
++	for _, reference := range []string{"../outside.mp3", "C:\\secret.mp3", "missing.mp3", "notes.txt"} {
++		os.WriteFile(cue, []byte("FILE \""+reference+"\" WAVE\n TRACK 01 AUDIO\n INDEX 01 00:00:00\n"), 0600)
++		if _, err := ResolveUploadFiles([]string{cue}); err == nil {
++			t.Fatalf("accepted %q", reference)
++		}
++	}
++	for _, index := range []string{"", "INDEX 01 00:61:00", "INDEX 01 00:00:75"} {
++		os.WriteFile(cue, []byte("FILE \"整轨.flac\" WAVE\n TRACK 01 AUDIO\n"+index+"\n"), 0600)
++		if _, err := ResolveUploadFiles([]string{cue}); err == nil {
++			t.Fatalf("accepted invalid index %q", index)
++		}
++	}
++}
++
++// Every supported audio extension is accepted case-insensitively; an index is not audio.
++func TestUploadAudioFormats(t *testing.T) {
++	for _, name := range []string{"a.MP3", "a.aac", "a.wma", "a.wav", "a.ogg", "a.m4a", "a.ape", "a.FLAC"} {
++		if !IsUploadAudio(name) {
++			t.Fatal(name)
++		}
++	}
++	for _, name := range []string{"a.cue", "a.flac.cue", "a.txt", "a.exe"} {
++		if IsUploadAudio(name) {
++			t.Fatal(name)
++		}
++	}
++}
+diff --git a/internal/music/convert.go b/internal/music/convert.go
+new file mode 100644
+index 0000000..69bd1cf
+--- /dev/null
++++ b/internal/music/convert.go
+@@ -0,0 +1,44 @@
++package music
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"maps"
++	"mygo-music/internal/i18n"
++	"os/exec"
++	"runtime"
++	"slices"
++)
++
++func ConvertToFLAC(ctx context.Context, input, output string, from, until int64, tags map[string]string) error {
++	name := "ffmpeg"
++	if runtime.GOOS == "windows" {
++		name += ".exe"
++	}
++	command, err := exec.LookPath(name)
++	if err != nil {
++		return errors.New(i18n.T("This audio format requires FFmpeg on PATH"))
++	}
++	args := []string{"-nostdin", "-v", "error", "-y", "-protocol_whitelist", "file,pipe"}
++	if from > 0 {
++		args = append(args, "-ss", fmt.Sprintf("%.6f", float64(from)/75))
++	}
++	args = append(args, "-i", input, "-map", "0:a:0", "-vn", "-ac", "2", "-c:a", "flac")
++	if until >= 0 {
++		args = append(args, "-t", fmt.Sprintf("%.6f", float64(until-from)/75))
++	}
++	for _, key := range slices.Sorted(maps.Keys(tags)) {
++		args = append(args, "-metadata", key+"="+tags[key])
++	}
++	args = append(args, output)
++	cmd := exec.CommandContext(ctx, command, args...)
++	hideAudioCommand(cmd)
++	if err := cmd.Run(); err != nil {
++		if ctx.Err() != nil {
++			return ctx.Err()
++		}
++		return fmt.Errorf(i18n.T("Audio conversion failed: %w"), err)
++	}
++	return nil
++}
+diff --git a/internal/music/convert_windows.go b/internal/music/convert_windows.go
+new file mode 100644
+index 0000000..1e96c00
+--- /dev/null
++++ b/internal/music/convert_windows.go
+@@ -0,0 +1,8 @@
++package music
++
++import (
++	"os/exec"
++	"syscall"
++)
++
++func hideAudioCommand(cmd *exec.Cmd) { cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true} }
+diff --git a/internal/music/convert_other.go b/internal/music/convert_other.go
+new file mode 100644
+index 0000000..7ab7373
+--- /dev/null
++++ b/internal/music/convert_other.go
+@@ -0,0 +1,7 @@
++//go:build !windows
++
++package music
++
++import "os/exec"
++
++func hideAudioCommand(cmd *exec.Cmd) {}
+diff --git a/internal/plugin/plugin.go b/internal/plugin/plugin.go
+index cc4e0a0..0005dbc 100644
+--- a/internal/plugin/plugin.go
++++ b/internal/plugin/plugin.go
+@@ -21,6 +21,7 @@
+ package plugin
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+@@ -166,6 +167,7 @@ type Plugin struct {
+ 	granted  bool // the listener let it start programs
+ 	vm       *vm
+ 	prompt   func(music.SignInPrompt)
++	upload   *selectedUpload
+ }
+ 
+ // OnSignInPrompt says what to do with what the plugin wants shown as it signs in.
+@@ -342,6 +344,9 @@ func (p *Plugin) Grant(on bool) error {
+ // Close stops the plugin, and the programs it started.
+ func (p *Plugin) Close() {
+ 	p.mu.Lock()
++	if p.upload != nil {
++		p.upload.cancel()
++	}
+ 	v := p.vm
+ 	p.vm = nil
+ 	p.mu.Unlock()
+@@ -546,6 +551,13 @@ func (p *Plugin) call(method string, params, out any) error {
+ }
+ 
+ func (p *Plugin) callWithin(timeout time.Duration, method string, params, out any) error {
++	return p.callContext(context.Background(), timeout, method, params, out)
++}
++
++func (p *Plugin) callContext(ctx context.Context, timeout time.Duration, method string, params, out any) error {
++	if err := ctx.Err(); err != nil {
++		return err
++	}
+ 	if !p.exports[method] {
+ 		return music.ErrUnsupported
+ 	}
+@@ -569,6 +581,8 @@ func (p *Plugin) callWithin(timeout time.Duration, method string, params, out an
+ 	timer := time.NewTimer(timeout)
+ 	defer timer.Stop()
+ 	select {
++	case <-ctx.Done():
++		return ctx.Err()
+ 	case a := <-ch:
+ 		if a.err != nil {
+ 			return a.err
+diff --git a/internal/plugin/host.go b/internal/plugin/host.go
+index be7c8ab..38da6cf 100644
+--- a/internal/plugin/host.go
++++ b/internal/plugin/host.go
+@@ -150,9 +150,11 @@ func (p *Plugin) installHost(v *vm) error {
+ 			}
+ 			return moejs.Undefined(), os.RemoveAll(filepath.Join(p.data, name))
+ 		}),
+-		"waitForRedirect": moejs.NativeFunc(p.waitForRedirect(v)),
+-		"webSignIn":       moejs.NativeFunc(p.webSignIn(v)),
+-		"spawn":           moejs.NativeFunc(p.spawn(v)),
++		"waitForRedirect":  moejs.NativeFunc(p.waitForRedirect(v)),
++		"webSignIn":        moejs.NativeFunc(p.webSignIn(v)),
++		"spawn":            moejs.NativeFunc(p.spawn(v)),
++		"uploadFile":       moejs.NativeFunc(p.uploadFile(v)),
++		"uploadCheckpoint": moejs.NativeFunc(p.uploadCheckpoint),
+ 	})
+ }
+ 
+diff --git a/internal/plugin/upload.go b/internal/plugin/upload.go
+new file mode 100644
+index 0000000..89d4b83
+--- /dev/null
++++ b/internal/plugin/upload.go
+@@ -0,0 +1,183 @@
++package plugin
++
++import (
++	"context"
++	"crypto/md5"
++	"crypto/rand"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"mygo-music/internal/i18n"
++	"net/http"
++	"os"
++	"time"
++
++	"github.com/MoeForge/moejs"
++	"github.com/dhowden/tag"
++	"mygo-music/internal/music"
++)
++
++type selectedUpload struct {
++	id       string
++	file     *os.File
++	size     int64
++	ctx      context.Context
++	cancel   context.CancelFunc
++	progress func(int64, int64)
++}
++
++// Upload exposes a short-lived handle for the chosen file, never arbitrary filesystem access.
++func (p *Plugin) Upload(ctx context.Context, path string, progress func(int64, int64)) error {
++	if !music.IsUploadAudio(path) {
++		return errors.New(i18n.T("Choose a supported audio file"))
++	}
++	f, err := os.Open(path)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++	stat, err := f.Stat()
++	if err != nil {
++		return err
++	}
++	if !stat.Mode().IsRegular() || stat.Size() == 0 {
++		return errors.New(i18n.T("Choose a valid audio file"))
++	}
++	ctx, cancel := context.WithTimeout(ctx, 30*time.Minute)
++	defer cancel()
++	u := &selectedUpload{id: rand.Text(), file: f, size: stat.Size(), ctx: ctx, cancel: cancel, progress: progress}
++	p.mu.Lock()
++	if p.upload != nil {
++		p.mu.Unlock()
++		return errors.New(i18n.T("A file is already uploading"))
++	}
++	p.upload = u
++	p.mu.Unlock()
++	defer func() { p.mu.Lock(); p.upload = nil; p.mu.Unlock() }()
++	hash := md5.New()
++	if _, err := io.Copy(hash, &uploadReader{Reader: f, ctx: ctx}); err != nil {
++		return err
++	}
++	info := map[string]any{"id": u.id, "name": stat.Name(), "size": u.size, "md5": hex.EncodeToString(hash.Sum(nil))}
++	if _, err := f.Seek(0, io.SeekStart); err != nil {
++		return err
++	}
++	if tags, err := tag.ReadFrom(f); err == nil {
++		info["title"], info["artist"], info["album"] = tags.Title(), tags.Artist(), tags.Album()
++	}
++	if progress != nil {
++		progress(0, u.size)
++	}
++	return p.callContext(ctx, 30*time.Minute, "upload", map[string]any{"file": info}, nil)
++}
++
++func (p *Plugin) selectedFile(id string) (*selectedUpload, error) {
++	p.mu.Lock()
++	u := p.upload
++	p.mu.Unlock()
++	if u == nil || u.id != id {
++		return nil, errors.New(i18n.T("This file was not selected for upload"))
++	}
++	if err := u.ctx.Err(); err != nil {
++		return nil, err
++	}
++	return u, nil
++}
++
++func (p *Plugin) uploadCheckpoint(_ *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
++	_, err := p.selectedFile(moejs.Arg(args, 0).String())
++	return moejs.Undefined(), err
++}
++
++func (p *Plugin) uploadFile(v *vm) native {
++	return func(_ *moejs.Realm, _ moejs.Value, args []moejs.Value) (moejs.Value, error) {
++		var opts struct {
++			ID      string            `json:"id"`
++			URL     string            `json:"url"`
++			Headers map[string]string `json:"headers"`
++		}
++		if err := v.rt.ToGoInto(moejs.Arg(args, 0), &opts); err != nil {
++			return moejs.Undefined(), err
++		}
++		u, err := p.selectedFile(opts.ID)
++		if err != nil {
++			return moejs.Undefined(), err
++		}
++		body := &uploadReader{Reader: io.NewSectionReader(u.file, 0, u.size), ctx: u.ctx, total: u.size, progress: u.progress}
++		req, err := http.NewRequestWithContext(u.ctx, http.MethodPost, opts.URL, body)
++		if err != nil {
++			return moejs.Undefined(), err
++		}
++		req.ContentLength = u.size
++		for name, value := range opts.Headers {
++			req.Header.Set(name, value)
++		}
++		p.mu.Lock()
++		web := p.webOptions()
++		p.mu.Unlock()
++		if web.Client == nil {
++			return moejs.Undefined(), errors.New(i18n.T("Uploads require network permission"))
++		}
++		if web.Allow != nil {
++			if err := web.Allow(req); err != nil {
++				return moejs.Undefined(), err
++			}
++		}
++		client := *web.Client
++		client.CheckRedirect = func(*http.Request, []*http.Request) error {
++			return errors.New(i18n.T("Upload redirects are not allowed"))
++		}
++		promise, settle := v.loop.NewPromise()
++		go func() {
++			data, err := sendUpload(&client, req)
++			settle(func(rt *moejs.Runtime) (moejs.Value, error) {
++				if err != nil {
++					return moejs.Undefined(), err
++				}
++				return rt.ParseJSON(data)
++			})
++		}()
++		return promise, nil
++	}
++}
++
++func sendUpload(client *http.Client, req *http.Request) ([]byte, error) {
++	res, err := client.Do(req)
++	if err != nil {
++		return nil, err
++	}
++	defer res.Body.Close()
++	if res.StatusCode < 200 || res.StatusCode >= 300 {
++		return nil, fmt.Errorf(i18n.T("Audio upload failed (HTTP %d)"), res.StatusCode)
++	}
++	data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
++	if err != nil {
++		return nil, err
++	}
++	if !json.Valid(data) {
++		return nil, errors.New(i18n.T("The upload server returned an invalid result"))
++	}
++	return data, nil
++}
++
++type uploadReader struct {
++	io.Reader
++	ctx               context.Context
++	sent, total, last int64
++	progress          func(int64, int64)
++}
++
++func (r *uploadReader) Read(b []byte) (int, error) {
++	if err := r.ctx.Err(); err != nil {
++		return 0, err
++	}
++	n, err := r.Reader.Read(b)
++	r.sent += int64(n)
++	if r.progress != nil && (r.sent-r.last >= 256<<10 || r.sent == r.total) {
++		r.last = r.sent
++		r.progress(r.sent, r.total)
++	}
++	return n, err
++}
+diff --git a/internal/plugin/upload_test.go b/internal/plugin/upload_test.go
+new file mode 100644
+index 0000000..edffde3
+--- /dev/null
++++ b/internal/plugin/upload_test.go
+@@ -0,0 +1,92 @@
++package plugin
++
++import (
++	"bytes"
++	"context"
++	"crypto/md5"
++	"encoding/hex"
++	"fmt"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// Only the chosen bytes are sent, and its handle expires as soon as the upload finishes.
++func TestSelectedUpload(t *testing.T) {
++	data := bytes.Repeat([]byte("audio fixture"), 50000)
++	digest := md5.Sum(data)
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		got, err := io.ReadAll(r.Body)
++		if err != nil || !bytes.Equal(got, data) {
++			t.Error("selected file bytes changed")
++		}
++		if r.ContentLength != int64(len(data)) || r.Header.Get("Cookie") != "" {
++			t.Error("wrong length or unintended cookies")
++		}
++		fmt.Fprintf(w, `{"offset":%d}`, len(got))
++	}))
++	defer server.Close()
++	p := load(t, `{"id":"x","permissions":{"network":["127.0.0.1"]}}`, fmt.Sprintf(`
++let saved;
++export async function upload({file}) {
++  if(file.md5!==%q || file.name!=="selected.MP3")throw new Error("bad metadata");
++  saved=file.id;
++  host.uploadCheckpoint(file.id);
++  const r=await host.uploadFile({id:file.id,url:%q,headers:{"x-nos-token":"test"}});
++  if(r.offset!==file.size)throw new Error("partial upload");
++}
++export function reuse(){return host.uploadFile({id:saved,url:%q});}
++`, hex.EncodeToString(digest[:]), server.URL, server.URL))
++	path := filepath.Join(t.TempDir(), "selected.MP3")
++	if err := os.WriteFile(path, data, 0600); err != nil {
++		t.Fatal(err)
++	}
++	var sent int64
++	if err := p.Upload(context.Background(), path, func(n, total int64) { sent = n }); err != nil {
++		t.Fatal(err)
++	}
++	if sent != int64(len(data)) {
++		t.Fatal("upload progress never finished")
++	}
++	if err := p.call("reuse", nil, nil); err == nil {
++		t.Fatal("expired file handle still works")
++	}
++}
++
++// A plugin cannot choose an arbitrary file or upload a selected one to an undeclared host.
++func TestUploadNeedsSelectionAndNetwork(t *testing.T) {
++	p := load(t, `{"id":"x","permissions":{"network":["allowed.invalid"]}}`, `
++export function withoutSelection(){return host.uploadFile({id:"invented",url:"https://allowed.invalid"});}
++export function upload({file}){return host.uploadFile({id:file.id,url:"https://not-allowed.invalid"});}
++`)
++	if err := p.call("withoutSelection", nil, nil); err == nil {
++		t.Fatal("unselected file accepted")
++	}
++	path := filepath.Join(t.TempDir(), "sample.mp3")
++	os.WriteFile(path, []byte("sample"), 0600)
++	if err := p.Upload(context.Background(), path, nil); err == nil {
++		t.Fatal("undeclared destination accepted")
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	if err := p.Upload(ctx, path, nil); err == nil {
++		t.Fatal("cancelled upload started")
++	}
++}
++
++// NOS redirects cannot forward a selected file or token to another destination.
++func TestUploadRejectsRedirect(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Redirect(w, r, "https://not-allowed.invalid", http.StatusTemporaryRedirect)
++	}))
++	defer server.Close()
++	p := load(t, `{"id":"x","permissions":{"network":["127.0.0.1"]}}`, fmt.Sprintf(`export function upload({file}){return host.uploadFile({id:file.id,url:%q});}`, server.URL))
++	path := filepath.Join(t.TempDir(), "sample.flac")
++	os.WriteFile(path, []byte("sample"), 0600)
++	if err := p.Upload(context.Background(), path, nil); err == nil {
++		t.Fatalf("got %v", err)
++	}
++}
+diff --git a/internal/app/ui_browse.go b/internal/app/ui_browse.go
+index f227282..0c8f0d8 100644
+--- a/internal/app/ui_browse.go
++++ b/internal/app/ui_browse.go
+@@ -64,6 +64,26 @@ func (a *app) browsePage(c *ui.Context) {
+ 		if d.page.Title != "" {
+ 			a.heading(c, d.page.Title, d.page.Subtitle)
+ 		}
++		if len(d.page.Tabs) > 0 {
++			at := 0
++			labels := make([]string, len(d.page.Tabs))
++			for i, tab := range d.page.Tabs {
++				labels[i] = tab.Title
++				if tab.Selected {
++					at = i
++				}
++			}
++			ui.Row(c).Margin(0, 0, 18, 0).Children(func() {
++				if segmented(c.Key("browse-tabs"), &at, labels...) {
++					page := d.page.Tabs[at].Page
++					a.open(route{page: pageBrowse, id: page})
++					a.loadBrowse(lib, page, true)
++				}
++			})
++		}
++		if d.page.Upload {
++			a.uploadControls(c, lib, id)
++		}
+ 	})
+ }
+ 
+diff --git a/internal/app/ui_main.go b/internal/app/ui_main.go
+index 3c5bacd..b13e2af 100644
+--- a/internal/app/ui_main.go
++++ b/internal/app/ui_main.go
+@@ -251,6 +251,11 @@ func (a *app) sidebar(c *ui.Context) {
+ func (a *app) navItem(c *ui.Context, icon *ui.SVG, label string, r route) {
+ 	p := a.pal
+ 	selected := a.route.page == r.page && !a.nowPlaying && (r.page != pageBrowse || a.route.id == r.id)
++	if r.page == pageBrowse && a.route.page == pageBrowse && !a.nowPlaying {
++		if d := a.browses[a.route.id]; d != nil && d.page != nil && d.page.NavigationPage == r.id {
++			selected = true
++		}
++	}
+ 	b := ui.ButtonBase(c.Key(label)).Height(34).PaddingX(10).Gap(10).Radius(8).AlignItems(ui.Center).Justify(ui.Start).FocusRing(false)
+ 	bg := ui.Transparent
+ 	switch {
+diff --git a/internal/app/sources.go b/internal/app/sources.go
+index 1102768..240571f 100644
+--- a/internal/app/sources.go
++++ b/internal/app/sources.go
+@@ -27,6 +27,7 @@ var capabilities = []string{
+ 	"search", "suggest",
+ 	"playlists", "playlist", "album", "artist", "liked", "recent",
+ 	"home", "browse",
++	"upload",
+ 	"isLiked", "like", "likeEpisode",
+ 	"createPlaylist", "renamePlaylist", "deletePlaylist", "addToPlaylist", "removeFromPlaylist", "movePlaylistTrack", "savePlaylist",
+ 	"followArtist", "saveAlbum", "savedAlbums",
+@@ -84,6 +85,7 @@ type library struct {
+ 	albums    map[string]*albumData
+ 	shows     map[string]*showData
+ 	browses   map[string]*browseData
++	upload    *uploadState
+ 	searches  map[route]*searchData
+ 	searched  route // the search last shown, which the sidebar goes back to
+ 
+diff --git a/internal/app/ui_upload.go b/internal/app/ui_upload.go
+new file mode 100644
+index 0000000..aa64d20
+--- /dev/null
++++ b/internal/app/ui_upload.go
+@@ -0,0 +1,138 @@
++package app
++
++import (
++	"context"
++	"errors"
++	"fmt"
++
++	"github.com/egoist/mygo"
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/music"
++)
++
++type uploadState struct {
++	busy                 bool
++	name                 string
++	at, total, succeeded int
++	sent, size           int64
++	errors               []string
++	cancel               context.CancelFunc
++	cancelled            bool
++}
++
++var pickUploadFiles = func(a *app, got func([]string, error)) {
++	go func() {
++		paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{Parent: a.win, Title: T("Upload Music"), ButtonLabel: T("Upload"), Multiple: true,
++			Filters: []mygo.FileFilter{{Name: T("Music files"), Extensions: music.UploadExtensions}}})
++		a.post(func() { got(paths, err) })
++	}()
++}
++
++func (a *app) chooseUpload(lib *library, page string) {
++	if lib.upload != nil && lib.upload.busy {
++		return
++	}
++	uploader, ok := lib.src.(music.Uploader)
++	if !ok || !lib.can("upload") {
++		return
++	}
++	state := &uploadState{busy: true}
++	lib.upload = state
++	pickUploadFiles(a, func(paths []string, err error) {
++		if err != nil {
++			state.busy = false
++			state.errors = []string{err.Error()}
++			return
++		}
++		if len(paths) == 0 {
++			lib.upload = nil
++			return
++		}
++		ctx, cancel := context.WithCancel(context.Background())
++		state.cancel, state.total = cancel, len(paths)
++		go func() {
++			defer cancel()
++			files, err := music.ResolveUploadFiles(paths)
++			if err != nil {
++				a.post(func() { state.busy = false; state.errors = []string{err.Error()} })
++				return
++			}
++			a.post(func() { state.total = len(files) })
++			for i, entry := range files {
++				if ctx.Err() != nil {
++					break
++				}
++				name := entry.Name
++				a.post(func() { state.at, state.name, state.sent, state.size = i+1, name, 0, 0 })
++				path, cleanup, err := music.PrepareUploadFile(ctx, entry)
++				if err == nil {
++					err = uploader.Upload(ctx, path, func(sent, total int64) { a.post(func() { state.sent, state.size = sent, total }) })
++				}
++				cleanup()
++				if err != nil {
++					if errors.Is(err, context.Canceled) {
++						break
++					}
++					a.post(func() { state.errors = append(state.errors, fmt.Sprintf("%s: %v", name, err)) })
++				} else {
++					a.post(func() { state.succeeded++ })
++				}
++			}
++			a.post(func() {
++				state.busy = false
++				// Refresh even after cancellation: earlier files in a batch may have completed.
++				for _, d := range lib.browses {
++					if d.page != nil && d.page.Upload {
++						d.page = nil
++					}
++				}
++				a.loadBrowse(lib, page, true)
++			})
++		}()
++	})
++}
++
++func (a *app) uploadControls(c *ui.Context, lib *library, page string) {
++	if !lib.can("upload") {
++		return
++	}
++	s := lib.upload
++	ui.Column(c).Gap(8).Margin(0, 0, 18, 0).Children(func() {
++		if s == nil || !s.busy || s.total == 0 {
++			ui.Row(c).Children(func() {
++				if pillButton(c.Key("upload"), iconPlus, T("Upload Music"), a.pal.accent, a.pal.onAccent).Clicked() {
++					a.chooseUpload(lib, page)
++				}
++			})
++		} else {
++			ui.Row(c).Gap(12).AlignItems(ui.Center).Children(func() {
++				label := Tf("Uploading %d/%d · %s", s.at, s.total, s.name)
++				ui.Text(c, label).FontSize(13).SingleLine().Shrink(1)
++				if s.cancel != nil && ui.Button(c.Key("cancel-upload"), T("Cancel Upload")).Clicked() {
++					s.cancelled = true
++					s.cancel()
++				}
++			})
++			if s.size > 0 {
++				percent := min(100, int(s.sent*100/s.size))
++				label := fmt.Sprintf("%d%%", percent)
++				if percent == 100 {
++					label = T("Saving to your cloud…")
++				}
++				ui.Text(c, label).FontSize(12).TextColor(a.pal.muted)
++			}
++		}
++		if s != nil && !s.busy {
++			label := Tf("Uploaded %d files", s.succeeded)
++			if s.cancelled {
++				label = Tf("Upload cancelled · %d files uploaded", s.succeeded)
++			}
++			ui.Text(c, label).FontSize(13).TextColor(a.pal.muted)
++		}
++		if s != nil {
++			for _, message := range s.errors {
++				ui.Text(c, message).FontSize(12).TextColor(a.pal.muted)
++			}
++		}
++	})
++}
+diff --git a/internal/app/helpers_test.go b/internal/app/helpers_test.go
+index bf40150..a961b06 100644
+--- a/internal/app/helpers_test.go
++++ b/internal/app/helpers_test.go
+@@ -1,6 +1,7 @@
+ package app
+ 
+ import (
++	"context"
+ 	"image"
+ 	"image/png"
+ 	"os"
+@@ -99,6 +100,14 @@ type fakeSource struct {
+ 	lyrics      func(id string) (*music.Lyrics, error)
+ 	stream      func(id, quality string) (*music.Stream, error)
+ 	setSetting  func(key, value string) error
++	uploadFile  func(context.Context, string, func(int64, int64)) error
++}
++
++func (s *fakeSource) Upload(ctx context.Context, path string, progress func(int64, int64)) error {
++	if s.uploadFile == nil {
++		return music.ErrUnsupported
++	}
++	return s.uploadFile(ctx, path, progress)
+ }
+ 
+ func newFakeSource(id string) *fakeSource {
+diff --git a/internal/app/upload_test.go b/internal/app/upload_test.go
+new file mode 100644
+index 0000000..873e782
+--- /dev/null
++++ b/internal/app/upload_test.go
+@@ -0,0 +1,125 @@
++package app
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"reflect"
++	"testing"
++
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/music"
++)
++
++// A browse tab opens its own data while keeping the source and queue.
++func TestBrowseTabNavigation(t *testing.T) {
++	a := newTestApp()
++	ch := posts(a)
++	f := fake(a)
++	tabs := []music.BrowseTab{{Title: "Subscribed", Page: "mine", Selected: true}, {Title: "Created", Page: "created"}}
++	a.browses["mine"] = &browseData{page: &music.Browse{Title: "Podcasts", Tabs: tabs}}
++	f.browse = func(page string) (*music.Browse, error) { return &music.Browse{Title: page}, nil }
++	a.route = route{page: pageBrowse, src: a.id, id: "mine"}
++	tt := ui.NewTester(a.view, 1200, 800)
++	tt.Frame()
++	if err := tt.Click("Created"); err != nil {
++		t.Fatal(err)
++	}
++	if a.route.id != "created" || a.route.src != a.id {
++		t.Fatalf("wrong route: %+v", a.route)
++	}
++	runPost(t, ch)
++	if a.browses["created"].page.Title != "created" {
++		t.Fatal("tab data did not load")
++	}
++}
++
++// Canceling the picker transfers nothing; a batch reports failures separately and refreshes the cloud page.
++func TestUploadPickerAndBatch(t *testing.T) {
++	a := newTestApp()
++	ch := posts(a)
++	f := fake(a)
++	real := pickUploadFiles
++	defer func() { pickUploadFiles = real }()
++	var picked func([]string, error)
++	pickers := 0
++	pickUploadFiles = func(_ *app, got func([]string, error)) { pickers++; picked = got }
++	a.browses["cloud"] = &browseData{page: &music.Browse{Title: "Cloud", Upload: true}}
++	a.route = route{page: pageBrowse, src: a.id, id: "cloud"}
++	tt := ui.NewTester(a.view, 1200, 800)
++	tt.Frame()
++	if err := tt.Click(T("Upload Music")); err != nil {
++		t.Fatal(err)
++	}
++	tt.Frame()
++	// The upload control stays in place while choosing, without opening another picker.
++	if err := tt.Click(T("Upload Music")); err != nil {
++		t.Fatal(err)
++	}
++	if pickers != 1 {
++		t.Fatalf("opened %d pickers", pickers)
++	}
++	picked(nil, nil)
++	if a.upload != nil {
++		t.Fatal("cancelled picker created an upload")
++	}
++	paths := uploadFixtureFiles(t, "first.mp3", "second.flac")
++	pickUploadFiles = func(_ *app, got func([]string, error)) { got(paths, nil) }
++	var uploaded []string
++	f.uploadFile = func(ctx context.Context, path string, progress func(int64, int64)) error {
++		uploaded = append(uploaded, path)
++		progress(10, 10)
++		if path == paths[1] {
++			return errors.New("offline")
++		}
++		return nil
++	}
++	f.browse = func(page string) (*music.Browse, error) { return &music.Browse{Title: "refreshed", Upload: true}, nil }
++	a.chooseUpload(a.library, "cloud")
++	until(t, ch, func() bool { return !a.upload.busy })
++	until(t, ch, func() bool { return a.browses["cloud"] != nil && a.browses["cloud"].page != nil })
++	if !reflect.DeepEqual(uploaded, paths) || a.upload.succeeded != 1 || len(a.upload.errors) != 1 {
++		t.Fatalf("wrong batch result: %+v", a.upload)
++	}
++}
++
++// Cancel stops the active upload and leaves later selected files untouched.
++func TestCancelUploadBatch(t *testing.T) {
++	a := newTestApp()
++	ch := posts(a)
++	f := fake(a)
++	real := pickUploadFiles
++	defer func() { pickUploadFiles = real }()
++	paths := uploadFixtureFiles(t, "first.mp3", "second.mp3")
++	pickUploadFiles = func(_ *app, got func([]string, error)) { got(paths, nil) }
++	started := make(chan struct{})
++	calls := 0
++	f.uploadFile = func(ctx context.Context, _ string, _ func(int64, int64)) error {
++		calls++
++		close(started)
++		<-ctx.Done()
++		return ctx.Err()
++	}
++	f.browse = func(string) (*music.Browse, error) { return &music.Browse{Upload: true}, nil }
++	a.chooseUpload(a.library, "cloud")
++	<-started
++	a.upload.cancel()
++	until(t, ch, func() bool { return !a.upload.busy })
++	if calls != 1 || a.upload.succeeded != 0 {
++		t.Fatal("cancelled batch continued")
++	}
++}
++
++func uploadFixtureFiles(t *testing.T, names ...string) []string {
++	t.Helper()
++	dir := t.TempDir()
++	paths := make([]string, len(names))
++	for i, name := range names {
++		paths[i] = filepath.Join(dir, name)
++		if err := os.WriteFile(paths[i], []byte("fixture"), 0600); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return paths
++}
+diff --git a/internal/i18n/zh_cn.go b/internal/i18n/zh_cn.go
+index 26e1d90..98f6af4 100644
+--- a/internal/i18n/zh_cn.go
++++ b/internal/i18n/zh_cn.go
+@@ -2,27 +2,60 @@ package i18n
+ 
+ // zhCN is the app's text in Simplified Chinese, by its English.
+ var zhCN = map[string]string{
+-	"%.1f GB used":                 "已用 %.1f GB",
+-	"%d MB used":                   "已用 %d MB",
+-	"%d albums":                    "%d 张专辑",
+-	"%d days ago":                  "%d 天前",
+-	"%d episodes":                  "%d 期",
+-	"%d hours ago":                 "%d 小时前",
+-	"%d minutes ago":               "%d 分钟前",
+-	"%d songs":                     "%d 首",
+-	"%d songs found":               "找到 %d 首歌曲",
+-	"%s Mini Player":               "%s迷你播放器",
+-	"%s and more · %s":             "%s 等 · %s",
+-	"%s isn't available right now": "%s 暂时不可用",
+-	"%s needs setting up first":    "%s 需要先进行设置",
+-	"%s, %s":                       "%s，%s",
+-	"1 GB":                         "1 GB",
+-	"1 album":                      "1 张专辑",
+-	"1 episode":                    "1 期",
+-	"1 song":                       "1 首",
+-	"10 GB":                        "10 GB",
+-	"2 GB":                         "2 GB",
+-	"5 GB":                         "5 GB",
++	"Choose a supported audio file":                "请选择支持的音乐文件",
++	"Choose a valid audio file":                    "请选择有效的音乐文件",
++	"A file is already uploading":                  "已有文件正在上传",
++	"This file was not selected for upload":        "没有获得这个文件的上传授权",
++	"Uploads require network permission":           "上传需要网络权限",
++	"Upload redirects are not allowed":             "上传不允许重定向",
++	"Audio upload failed (HTTP %d)":                "音频上传失败 (HTTP %d)",
++	"The upload server returned an invalid result": "上传服务器返回了无效结果",
++	"Unsupported audio file: %s":                   "不支持的音频文件：%s",
++	"Invalid or oversized CUE sheet":               "CUE 索引文件无效或过大",
++	"Invalid CUE FILE entry":                       "CUE 的 FILE 文件声明无效",
++	"CUE references must stay within its folder":   "CUE 只能引用所在目录内的音频，其他位置请直接选择音频文件",
++	"CUE references an unsupported audio file":     "CUE 引用了不支持的音频文件",
++	"CUE requires AUDIO tracks and a FILE entry":   "CUE 需要有效的 FILE 声明和 AUDIO 曲目",
++	"Invalid CUE track number":                     "CUE 曲目编号无效",
++	"CUE INDEX has no track":                       "CUE 的 INDEX 没有对应曲目",
++	"Invalid CUE track time":                       "CUE 曲目时间无效",
++	"CUE sheet has no audio tracks":                "CUE 索引没有音频曲目",
++	"CUE track is missing INDEX 01":                "CUE 曲目缺少 INDEX 01 起始时间",
++	"CUE track times must increase":                "CUE 曲目的起始时间必须递增",
++	"This audio format requires FFmpeg on PATH":    "此音频格式需要安装 FFmpeg 并加入 PATH",
++	"Audio conversion failed: %w":                  "音频处理失败：%w",
++
++	"Music files":                          "音乐文件",
++	"Choose music files":                   "选择音乐文件",
++	"Upload Music":                         "上传音乐",
++	"Upload":                               "上传",
++	"Choose MP3, FLAC or M4A files":        "选择 MP3、FLAC 或 M4A 音乐文件",
++	"Uploading %d/%d · %s":                 "正在上传 %d/%d · %s",
++	"Cancel Upload":                        "取消上传",
++	"Saving to your cloud…":                "正在保存到云盘…",
++	"Uploaded %d files":                    "已上传 %d 个文件",
++	"Upload cancelled · %d files uploaded": "已取消上传 · 已完成 %d 个文件",
++	"%.1f GB used":                         "已用 %.1f GB",
++	"%d MB used":                           "已用 %d MB",
++	"%d albums":                            "%d 张专辑",
++	"%d days ago":                          "%d 天前",
++	"%d episodes":                          "%d 期",
++	"%d hours ago":                         "%d 小时前",
++	"%d minutes ago":                       "%d 分钟前",
++	"%d songs":                             "%d 首",
++	"%d songs found":                       "找到 %d 首歌曲",
++	"%s Mini Player":                       "%s迷你播放器",
++	"%s and more · %s":                     "%s 等 · %s",
++	"%s isn't available right now":         "%s 暂时不可用",
++	"%s needs setting up first":            "%s 需要先进行设置",
++	"%s, %s":                               "%s，%s",
++	"1 GB":                                 "1 GB",
++	"1 album":                              "1 张专辑",
++	"1 episode":                            "1 期",
++	"1 song":                               "1 首",
++	"10 GB":                                "10 GB",
++	"2 GB":                                 "2 GB",
++	"5 GB":                                 "5 GB",
+ 	"A small player at the notch on top of the screen, which opens as the pointer rests on it": "在屏幕顶部的刘海处显示迷你播放器，鼠标悬停即可展开",
+ 	"About":                                  "简介",
+ 	"About %s":                               "关于%s",
+diff --git a/internal/player/stream.go b/internal/player/stream.go
+index 150aa53..302640f 100644
+--- a/internal/player/stream.go
++++ b/internal/player/stream.go
+@@ -34,6 +34,7 @@ type download struct {
+ 	done   bool
+ 	err    error
+ 	cancel context.CancelFunc
++	ctx    context.Context
+ 	// part is the file's path until the cache keeps it, which keep does
+ 	// once the song has all come in: the path it is at then.
+ 	part string
+@@ -52,7 +53,7 @@ type download struct {
+ // without one.
+ func startDownload(url string, size int64, headers map[string]string, part *os.File, keep func(string, int64) (string, bool)) *download {
+ 	ctx, cancel := context.WithCancel(context.Background())
+-	d := &download{size: size, cancel: cancel, users: 2}
++	d := &download{size: size, cancel: cancel, ctx: ctx, users: 2}
+ 	d.cond.L = &d.mu
+ 	switch {
+ 	case part != nil:
+@@ -73,7 +74,8 @@ func prealloc(size int64) int64 { return min(size, maxPrealloc) }
+ 
+ // downloaded returns a download that has all of b in already.
+ func downloaded(b []byte) *download {
+-	d := &download{data: b, n: int64(len(b)), size: int64(len(b)), done: true, cancel: func() {}, users: 1}
++	ctx, cancel := context.WithCancel(context.Background())
++	d := &download{data: b, n: int64(len(b)), size: int64(len(b)), done: true, ctx: ctx, cancel: cancel, users: 1}
+ 	d.cond.L = &d.mu
+ 	return d
+ }
+@@ -81,7 +83,8 @@ func downloaded(b []byte) *download {
+ // opened returns a download that has all of the file f in already, of
+ // size bytes, as a song from the cache or from disk.
+ func opened(f *os.File, size int64) *download {
+-	d := &download{file: f, n: size, size: size, done: true, cancel: func() {}, users: 1, onDisk: true}
++	ctx, cancel := context.WithCancel(context.Background())
++	d := &download{file: f, n: size, size: size, done: true, ctx: ctx, cancel: cancel, users: 1, onDisk: true}
+ 	d.cond.L = &d.mu
+ 	return d
+ }
+@@ -339,7 +342,16 @@ func openStream(dl *download, durationMs int64) (stream, error) {
+ 		case "fLaC":
+ 			return openFLACStream(dl)
+ 		case "OggS":
+-			return openOggStream(dl, durationMs)
++			if s, err := openOggStream(dl, durationMs); err == nil {
++				return s, nil
++			}
++			return openCompatibleStream(dl)
++		}
++	}
++	if dl.waitFor(off+12) >= off+12 {
++		header := dl.peek(off, 12)
++		if string(header[4:8]) == "ftyp" || string(header[:4]) == "RIFF" || string(header[:4]) == "MAC " || string(header[:4]) == "\x30\x26\xb2\x75" || header[0] == 0xff && header[1]&0xf6 == 0xf0 {
++			return openCompatibleStream(dl)
+ 		}
+ 	}
+ 	return openMP3Stream(dl, durationMs)
+@@ -364,6 +376,8 @@ func openShared(dl *download, durationMs int64) (stream, error) {
+ 		s.spec, s.drop = nil, dl.release
+ 	case *oggStream:
+ 		s.spec, s.drop = nil, dl.release
++	case *compatibleStream:
++		s.spec, s.release = nil, dl.release
+ 	}
+ 	return s, nil
+ }
+diff --git a/internal/player/compatible.go b/internal/player/compatible.go
+new file mode 100644
+index 0000000..9d2713d
+--- /dev/null
++++ b/internal/player/compatible.go
+@@ -0,0 +1,92 @@
++package player
++
++import (
++	"context"
++	"errors"
++	"io"
++	"math"
++	"mygo-music/internal/music"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++)
++
++// Compatibility formats use the installed FFmpeg; the original cloud file stays unchanged.
++// shortcut: these formats wait for the whole download; use a streaming decoder if startup delay becomes a problem.
++var convertAudio = func(ctx context.Context, input, output string) error {
++	return music.ConvertToFLAC(ctx, input, output, 0, -1, nil)
++}
++
++type compatibleStream struct {
++	*flacStream
++	original *download
++	dir      string
++	release  func()
++	once     sync.Once
++}
++
++func openCompatibleStream(dl *download) (*compatibleStream, error) {
++	dl.waitFor(math.MaxInt64)
++	dl.mu.Lock()
++	err, closed := dl.err, dl.closed
++	dl.mu.Unlock()
++	if err != nil {
++		return nil, err
++	}
++	if closed {
++		return nil, errors.New("audio download closed")
++	}
++	dir, err := os.MkdirTemp("", "mygo-audio-")
++	if err != nil {
++		return nil, err
++	}
++	ok := false
++	defer func() {
++		if !ok {
++			os.RemoveAll(dir)
++		}
++	}()
++	input := filepath.Join(dir, "source.audio")
++	f, err := os.Create(input)
++	if err != nil {
++		return nil, err
++	}
++	_, err = io.Copy(f, &downloadReader{d: dl})
++	closeErr := f.Close()
++	if err != nil {
++		return nil, err
++	}
++	if closeErr != nil {
++		return nil, closeErr
++	}
++	output := filepath.Join(dir, "decoded.flac")
++	ctx, cancel := context.WithTimeout(dl.ctx, 5*time.Minute)
++	defer cancel()
++	if err := convertAudio(ctx, input, output); err != nil {
++		return nil, err
++	}
++	f, err = os.Open(output)
++	if err != nil {
++		return nil, err
++	}
++	stat, err := f.Stat()
++	if err != nil {
++		f.Close()
++		return nil, err
++	}
++	converted := opened(f, stat.Size())
++	stream, err := openFLACStream(converted)
++	if err != nil {
++		converted.Close()
++		return nil, err
++	}
++	ok = true
++	return &compatibleStream{flacStream: stream, original: dl, dir: dir, release: dl.Close}, nil
++}
++
++func (s *compatibleStream) source() (*download, *spectrum) { return s.original, s.spec }
++func (s *compatibleStream) Close() error {
++	s.once.Do(func() { s.flacStream.Close(); s.release(); os.RemoveAll(s.dir) })
++	return nil
++}
+diff --git a/internal/player/compatible_test.go b/internal/player/compatible_test.go
+new file mode 100644
+index 0000000..95756cf
+--- /dev/null
++++ b/internal/player/compatible_test.go
+@@ -0,0 +1,51 @@
++package player
++
++import (
++	"context"
++	"os"
++	"testing"
++)
++
++// M4A cloud bytes use compatible decoding, while shared readers leave the original alive.
++func TestCompatibleCloudAudio(t *testing.T) {
++	real := convertAudio
++	defer func() { convertAudio = real }()
++	fixture, err := os.ReadFile("testdata/seek.flac")
++	if err != nil {
++		t.Fatal(err)
++	}
++	convertAudio = func(_ context.Context, input, output string) error {
++		data, err := os.ReadFile(input)
++		if err != nil {
++			return err
++		}
++		if string(data[4:8]) != "ftyp" {
++			t.Fatal("wrong source bytes")
++		}
++		return os.WriteFile(output, fixture, 0600)
++	}
++	dl := downloaded([]byte("\x00\x00\x00\x1cftypM4A \x00\x00\x00\x00"))
++	s, err := openStream(dl, 3000)
++	if err != nil {
++		t.Fatal(err)
++	}
++	shared, err := openShared(dl, 3000)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := shared.Read(make([]float32, 64)); err != nil {
++		t.Fatal(err)
++	}
++	shared.Close()
++	if dl.closed {
++		t.Fatal("closing the shared reader closed the original")
++	}
++	dir := s.(*compatibleStream).dir
++	s.Close()
++	if !dl.closed {
++		t.Fatal("source was not released")
++	}
++	if _, err := os.Stat(dir); !os.IsNotExist(err) {
++		t.Fatal("temporary decoded audio was left behind")
++	}
++}

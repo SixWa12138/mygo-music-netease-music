@@ -8,6 +8,7 @@
 // makes VIP songs play whole rather than their first 45 seconds.
 
 const site = "https://music.163.com";
+const clientSite = "https://interfacepc.music.163.com";
 const webUA =
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
@@ -286,20 +287,21 @@ function eapiHeader() {
 async function eapi(uri, payload, antiCheat) {
   const header = eapiHeader();
   if (antiCheat) header["X-antiCheatToken"] = checkToken;
-  const cookieParts = { ...header };
-  const session = cookieValue("MUSIC_U");
-  if (session) cookieParts.MUSIC_U = session;
-  const anonymous = cookieValue("MUSIC_A");
-  if (anonymous) cookieParts.MUSIC_A = anonymous;
+  // The client sends its session in both the encrypted header and Cookie.
+  for (const name of ["MUSIC_U", "MUSIC_A", "NMTID"]) {
+    const value = cookieValue(name);
+    if (value) header[name] = value;
+  }
   const text = JSON.stringify({ ...payload, header, e_r: false });
   const digest = host.crypto.md5(`nobody${uri}use${text}md5forencrypt`);
   const params = host.crypto.aesEcbEncrypt(eapiKey, `${uri}-36cd479b6b5-${text}-36cd479b6b5-${digest}`).toUpperCase();
-  const res = await fetch(`${site}/eapi/${uri.slice(5)}`, {
+  const res = await fetch(`${clientSite}/eapi/${uri.slice(5)}`, {
     method: "POST",
+    redirect: "error",
     headers: {
       "user-agent": apiUA,
       "content-type": "application/x-www-form-urlencoded",
-      cookie: Object.entries(cookieParts)
+      cookie: Object.entries(header)
         .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
         .join("; "),
     },
@@ -342,6 +344,8 @@ function albumEntryOf(a) {
 // A track whose copyright is gone is still listed, greyed out, as its website
 // lists it.
 function unavailableOf(s) {
+  // A catalog restriction does not rule out the listener's uploaded copy.
+  if (s.pc) return false;
   return Boolean(s.st < 0 || s.status < 0 || s.noCopyrightRcmd || (s.privilege && s.privilege.st < 0));
 }
 
@@ -577,6 +581,9 @@ export async function browse({ page }) {
     return { title: cookie() ? "每日推荐" : "今日推荐", subtitle: "今天为你挑的歌", sections: [{ tracks: songs }] };
   }
   if (page === "playlists") return playlistSquare();
+  if (page === "podcasts") return podcastSquare();
+  if (page === "my-podcasts" || /^my-podcasts:(created|purchased|liked)(:\d+)?$/.test(page) || /^my-podcasts:subscribed:\d+$/.test(page)) return myPodcasts(page);
+  if (page === "cloud" || /^cloud:\d+$/.test(page)) return cloudPage(Number(page.split(":")[1] || 0));
   throw fail("unavailable", `没有这个页面：${page}`);
 }
 
@@ -588,9 +595,220 @@ async function playlistSquare() {
   };
 }
 
+// Podcasts use program IDs for their pages and comments; audio has a separate song ID.
+const programIdOf = (id) => /^dj:(\d+)$/.exec(String(id))?.[1];
+
+function showOf(radio) {
+  return {
+    id: String(radio.id || radio.voiceListId),
+    name: radio.name || radio.voiceListName || "",
+    imageUrl: pictureOf(radio.picUrl || radio.coverUrl),
+    description: radio.desc || radio.rcmdtext || radio.copywriter || undefined,
+    publisher: radio.dj?.nickname || radio.userName || undefined,
+    episodeCount: radio.programCount || radio.voiceCount || 0,
+    subscribed: Boolean(radio.subed),
+  };
+}
+
+function episodeOf(program) {
+  const song = program.mainSong || {};
+  const radio = program.radio || {};
+  return {
+    id: `dj:${program.id}`,
+    name: program.name || song.name || "",
+    artists: [{ id: "", name: program.dj?.nickname || radio.dj?.nickname || "" }],
+    album: { id: "", name: radio.name || "", imageUrl: pictureOf(program.coverUrl || radio.picUrl) },
+    duration: Number(program.duration || song.duration || song.dt || 0),
+    showId: String(radio.id || ""),
+    description: program.description || program.programDesc || undefined,
+    published: dateOf(program.createTime),
+    url: `${site}/program?id=${program.id}`,
+    unavailable: !song.id || song.status < 0 || song.st < 0 || undefined,
+  };
+}
+
+async function podcastSquare() {
+  const [recommended, hot] = await Promise.all([
+    eapi("/api/djradio/recommend/v1", {}),
+    eapi("/api/djradio/hot/v1", { limit: 24, offset: 0 }),
+  ]);
+  return {
+    title: "播客",
+    sections: [
+      { title: "推荐播客", shows: (recommended.djRadios || []).map(showOf) },
+      { title: "热门播客", shows: (hot.djRadios || []).map(showOf) },
+    ],
+  };
+}
+
+export async function shows() {
+  needAccount();
+  const out = [];
+  for (let offset = 0; ;) {
+    const r = await eapi("/api/djradio/get/subed", { limit: 100, offset, total: true });
+    const radios = r.djRadios || [];
+    out.push(...radios.map((radio) => ({ ...showOf(radio), subscribed: true })));
+    if (!r.hasMore || !radios.length) return out;
+    offset += radios.length;
+  }
+}
+
+export async function show({ id, offset = 0 }) {
+  const [detail, episodes] = await Promise.all([
+    eapi("/api/djradio/get", { id: Number(id) }),
+    eapi("/api/dj/program/byradio", { radioId: Number(id), limit: 30, offset, asc: false }),
+  ]);
+  if (!detail.djRadio) throw fail("unavailable", "这个播客已不可用。");
+  return {
+    show: showOf(detail.djRadio),
+    episodes: (episodes.programs || []).map(episodeOf),
+    more: Boolean(episodes.more),
+  };
+}
+
+export async function subscribeShow({ id, on }) {
+  needAccount();
+  await eapi("/api/djradio/sub", { id: Number(id), sub: Boolean(on) });
+}
+
+// These are the desktop client's four library tabs, not discovery categories.
+async function myPodcasts(page) {
+  needAccount();
+  const who = await current();
+  if (!who) throw fail("signIn", "请先登录网易云音乐。");
+  const [, tab = "subscribed", cursor = "0"] = page.split(":");
+  const offset = Number(cursor), limit = 100;
+  if (!Number.isSafeInteger(offset) || offset < 0) throw fail("unavailable", "无效的播客页码。");
+  const purchased = eapi("/api/voicelist/bought/list", { limit: tab === "purchased" ? limit : 1, offset: tab === "purchased" ? offset : 0 });
+  const [counts, likedCount, bought] = await Promise.all([
+    quietly(eapi("/api/djradio/get/create/sub/count", { userId: Number(who.id) }), {}),
+    quietly(eapi("/api/content/my/liked/voice/count", {}), {}),
+    tab === "purchased" ? purchased : quietly(purchased, {}),
+  ]);
+  let entries, section, more;
+  if (tab === "subscribed" || tab === "created") {
+    const r = await eapi(tab === "created" ? "/api/djradio/get/byuser/v1" : "/api/djradio/get/subed", {
+      userId: Number(who.id), limit, offset, total: true,
+    });
+    entries = r.djRadios || [];
+    section = { shows: entries.map(radio => ({ ...showOf(radio), subscribed: tab === "subscribed" || Boolean(radio.subed) })) };
+    more = r.hasMore;
+  } else if (tab === "liked") {
+    const r = await eapi("/api/content/my/liked/voice", { limit, offset });
+    entries = r.data?.data || [];
+    section = { tracks: entries.map(voiceOf) };
+    more = r.data?.hasMore;
+  } else {
+    entries = bought.data?.list || [];
+    section = {
+      shows: entries.filter(item => item.productType !== 1).map(showOf),
+      tracks: entries.filter(item => item.productType === 1).map(voiceOf),
+    };
+    more = bought.data?.hasMore;
+  }
+  const labels = [
+    ["subscribed", "收藏播客", counts.subRadioCount],
+    ["created", "创建播客", counts.createRadioCount],
+    ["purchased", "购买播客", bought.data?.count],
+    ["liked", "喜欢的声音", likedCount.data],
+  ];
+  const pageOf = (kind, at = 0) => kind === "subscribed" && at === 0 ? "my-podcasts" : `my-podcasts:${kind}${at ? `:${at}` : ""}`;
+  const links = [];
+  if (offset > 0) links.push({ title: "上一页", page: pageOf(tab, Math.max(0, offset - limit)) });
+  if (more && entries.length) links.push({ title: "下一页", page: pageOf(tab, offset + entries.length) });
+  return {
+    title: "我的播客",
+    navigationPage: "my-podcasts",
+    tabs: labels.map(([kind, title, count]) => ({ title: `${title}${typeof count === "number" ? ` ${count}` : ""}`, page: pageOf(kind), selected: kind === tab })),
+    sections: [entries.length ? section : { title: { subscribed: "还没有收藏的播客", created: "还没有创建的播客", purchased: "还没有购买的播客", liked: "还没有喜欢的声音" }[tab] }, ...(links.length ? [{ links }] : [])],
+  };
+}
+
+function voiceOf(voice) {
+  return episodeOf({ ...voice, id: voice.voiceId || voice.id, name: voice.voiceName || voice.name,
+    createTime: voice.publishTime || voice.createTime, coverUrl: voice.coverUrl,
+    dj: voice.dj || { nickname: voice.userName },
+    mainSong: voice.mainSong || { id: voice.trackId, duration: voice.duration },
+  });
+}
+
+async function cloudPage(offset) {
+  needAccount();
+  if (!Number.isSafeInteger(offset) || offset < 0) throw fail("unavailable", "无效的云盘页码。");
+  const limit = 200;
+  const r = await eapi("/api/v1/cloud/get", { limit, offset });
+  const entries = r.data || [];
+  const tracks = entries.map((entry) => {
+    const song = entry.simpleSong || {};
+    return trackOf({
+      ...song,
+      id: entry.songId || song.id,
+      name: entry.songName || song.name || entry.fileName,
+      ar: song.ar?.length ? song.ar : [{ name: entry.artist || "" }],
+      al: song.al || { name: entry.album || "" },
+      pc: entry,
+    });
+  }).filter(Boolean);
+  const links = [];
+  if (offset > 0) links.push({ title: "上一页", page: `cloud:${Math.max(0, offset - limit)}` });
+  if (r.hasMore && entries.length) links.push({ title: "下一页", page: `cloud:${offset + entries.length}` });
+  return {
+    title: "音乐云盘",
+    subtitle: `共 ${r.count || 0} 首已上传的音乐`,
+    upload: true,
+    sections: [{ tracks }, ...(links.length ? [{ links }] : [])],
+  };
+}
+
+// The host streams only the file selected in its native picker, without loading it into JavaScript.
+export async function upload({ file }) {
+  needAccount();
+  if (!host.uploadFile || !host.uploadCheckpoint) throw fail("unsupported", "请安装支持云盘上传的 MyGo Music 配套版本。");
+  const mimeTypes = { mp3: "audio/mpeg", aac: "audio/aac", wma: "audio/x-ms-wma", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4", ape: "audio/x-ape", flac: "audio/flac" };
+  const ext = file?.name?.split(".").pop().toLowerCase();
+  if (!file || !/^[a-f0-9]{32}$/i.test(file.md5) || !Number.isSafeInteger(file.size) || file.size <= 0 || !Object.hasOwn(mimeTypes, ext)) {
+    throw fail("unavailable", "请选择有效的音乐文件。");
+  }
+  const checkpoint = () => host.uploadCheckpoint(file.id);
+  checkpoint();
+  const check = await eapi("/api/cloud/upload/check", { bitrate: "999000", ext: "", length: file.size, md5: file.md5, songId: "0", version: 1 });
+  checkpoint();
+  const bucket = "jd-musicrep-privatecloud-audio-public";
+  const tokenReply = await eapi("/api/nos/token/alloc", {
+    bucket, ext, filename: file.name.replace(/\.[^.]+$/, ""),
+    local: false, nos_product: 3, type: "audio", md5: file.md5,
+  });
+  const token = tokenReply.result;
+  if (!token?.resourceId || !token.objectKey || !token.token) throw new Error("未能取得云盘上传凭据，请重试。");
+  checkpoint();
+  if (check.needUpload) {
+    const response = await fetch(`https://wanproxy.127.net/lbs?version=1.0&bucketname=${bucket}`, { redirect: "error" });
+    if (!response.ok) throw new Error("无法获取云盘上传服务器。");
+    const lbs = await response.json();
+    const server = String(lbs.upload?.[0] || "").replace(/^http:/, "https:");
+    // NOS tokens and selected file bytes must stay on the official upload service.
+    if (!/^https:\/\/[a-z0-9.-]+\.127\.net(?::443)?\/?$/i.test(server)) throw new Error("网易云返回了无效的上传服务器。");
+    checkpoint();
+    const result = await host.uploadFile({ id: file.id,
+      url: `${server.replace(/\/$/, "")}/${bucket}/${encodeURIComponent(token.objectKey)}?offset=0&complete=true&version=1.0`,
+      headers: { "x-nos-token": token.token, "Content-MD5": file.md5, "Content-Type": mimeTypes[ext] },
+    });
+    if (typeof result?.offset === "number" && result.offset !== file.size) throw new Error("音频没有完整上传，请重试。");
+  }
+  checkpoint();
+  const info = await eapi("/api/upload/cloud/info/v2", {
+    md5: file.md5, songid: check.songId, filename: file.name,
+    song: file.title || file.name.replace(/\.[^.]+$/, ""), album: file.album || "未知专辑", artist: file.artist || "未知艺术家",
+    bitrate: "999000", resourceId: token.resourceId,
+  });
+  if (!info.songId) throw new Error("网易云未能保存歌曲信息，请重试。");
+  checkpoint();
+  await eapi("/api/cloud/pub/v2", { songid: info.songId });
+}
+
 // Search. Each kind has its type, which the service numbers rather than names.
 
-const searchTypes = { tracks: 1, albums: 10, artists: 100, playlists: 1000 };
+const searchTypes = { tracks: 1, albums: 10, artists: 100, playlists: 1000, shows: 1009 };
 const searchPage = 30;
 
 export async function search({ query, kind, offset }) {
@@ -608,6 +826,9 @@ export async function search({ query, kind, offset }) {
   } else if (kind === "artists") {
     out.artists = (result.artists || []).map(artistOf);
     out.more = offset + out.artists.length < (result.artistCount || 0);
+  } else if (kind === "shows") {
+    out.shows = (result.djRadios || []).map(showOf);
+    out.more = offset + out.shows.length < (result.djRadiosCount || 0);
   } else {
     out.playlists = (result.playlists || []).map(playlistOf);
     out.more = offset + out.playlists.length < (result.playlistCount || 0);
@@ -702,6 +923,11 @@ async function songsById(ids) {
     const r = await api("/api/v3/song/detail", { c });
     out.push(...tracksOf(r.songs));
   }
+  const programs = ids.map(programIdOf).filter(Boolean);
+  for (let at = 0; at < programs.length; at += 5) {
+    const replies = await Promise.all(programs.slice(at, at + 5).map((id) => eapi("/api/dj/program/detail", { id: Number(id) })));
+    for (const reply of replies) if (reply.program) out.push(episodeOf(reply.program));
+  }
   return out;
 }
 
@@ -756,7 +982,7 @@ export async function isLiked({ ids }) {
 
 export async function like({ id, on }) {
   needAccount();
-  await weapi("/weapi/radio/like", { alg: "itembased", trackId: Number(id), like: Boolean(on), time: "3" });
+  await eapi("/api/radio/like", { alg: "itembased", trackId: Number(id), like: Boolean(on), time: "3" });
   if (likedCache) {
     const key = String(id);
     likedCache = on ? [key, ...likedCache.filter((x) => x !== key)] : likedCache.filter((x) => x !== key);
@@ -766,7 +992,7 @@ export async function like({ id, on }) {
 // What was played: the app's own list of it, and the service's when signed in.
 
 export function played({ id }) {
-  host.storage.set("lastPlayed", id);
+  if (!programIdOf(id)) host.storage.set("lastPlayed", id);
   const stored = host.storage.get("recent");
   const list = (Array.isArray(stored) ? stored : []).filter((x) => x !== id);
   list.unshift(id);
@@ -849,7 +1075,7 @@ async function similarTo(seed, limit) {
 
 // Comments, which is half of what NetEase is to people.
 
-const threadOf = (trackId) => `R_SO_4_${trackId}`;
+const threadOf = (trackId) => programIdOf(trackId) ? `A_DJ_1_${programIdOf(trackId)}` : `R_SO_4_${trackId}`;
 
 function commentOf(c) {
   return {
@@ -898,6 +1124,7 @@ export async function postComment({ trackId, text }) {
 // Lyrics, as LRC and its translation, which the app times itself.
 
 export async function lyrics({ id }) {
+  if (programIdOf(id)) return { lrc: "" };
   const r = await api("/api/song/lyric", { id, lv: -1, kv: -1, tv: -1 });
   return {
     lrc: (r.lrc && r.lrc.lyric) || "",
@@ -915,9 +1142,22 @@ const levels = {
 };
 
 async function audioOf(id, level, encode) {
-  const r = await api("/api/song/enhance/player/url/v1", { ids: `[${id}]`, level, encodeType: encode });
-  const found = (r.data || [])[0];
-  return found && found.url ? found : null;
+  const ids = JSON.stringify([Number(id)]);
+  const playable = (reply) => (reply.data || []).find((song) =>
+    String(song.id) === String(id) && song.url && (song.code === undefined || song.code === 200)) || null;
+  let firstError;
+  try {
+    const found = playable(await eapi("/api/song/enhance/player/url/v1", { ids, level, encodeType: encode }));
+    if (found) return found;
+  } catch (error) {
+    if (error.code === "signIn") throw error;
+    firstError = error;
+  }
+  // The bitrate endpoint can still serve cloud copies when v1 refuses them.
+  const br = { standard: 128000, exhigh: 320000, lossless: 999000 }[level];
+  const found = playable(await eapi("/api/song/enhance/player/url", { ids, br }));
+  if (!found && firstError) throw firstError;
+  return found;
 }
 
 const qualityOf = (d) =>
@@ -926,23 +1166,31 @@ const qualityOf = (d) =>
 const finite = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
 
 export async function stream({ id, quality }) {
+  const programId = programIdOf(id);
+  if (programId) {
+    const r = await eapi("/api/dj/program/detail", { id: Number(programId) });
+    id = r.program?.mainSong?.id;
+    if (!id) throw fail("unavailable", "这个播客节目没有可播放的音频。");
+  }
   const asked = levels[quality] || levels.standard;
   let found = null;
   // A level the listener's membership doesn't reach comes back as a lower one,
   // or as nothing: the one below it is worth trying.
-  for (const step of [asked, levels.high, levels.standard]) {
+  const choices = [levels.lossless, levels.high, levels.standard];
+  for (const step of choices.slice(choices.indexOf(asked))) {
     found = await audioOf(id, step.level, step.encode);
     if (found) break;
   }
   if (!found) throw fail("unavailable", "这首歌没有可播放的地址：可能已下架，或者需要会员。");
   return {
-    url: found.url,
-    type: found.type === "flac" ? "flac" : "mp3",
+    url: pictureOf(found.url),
+    type: String(found.type).toLowerCase() === "flac" ? "flac" : "mp3",
     quality: qualityOf(found),
     bitRate: found.br || undefined,
     size: found.size || undefined,
     gain: finite(found.gain),
     peak: finite(found.peak),
+    headers: { "user-agent": webUA, referer: `${site}/` },
   };
 }
 
@@ -967,7 +1215,10 @@ export async function deletePlaylist({ id }) {
 }
 
 // The ids go as strings, as its own apps send them.
-const trackIdsOf = (trackIds) => JSON.stringify(trackIds.map(String));
+const trackIdsOf = (trackIds) => {
+  if (trackIds.some(programIdOf)) throw fail("unsupported", "播客节目不能加入歌曲歌单。");
+  return JSON.stringify(trackIds.map(String));
+};
 
 export async function addToPlaylist({ id, trackIds }) {
   needAccount();
