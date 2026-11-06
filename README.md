@@ -6,6 +6,8 @@ Plays NetEase Cloud Music in [MyGo Music](https://github.com/egoist/mygo-music):
 
 It isn't affiliated with or endorsed by NetEase. It uses the private API of the website, which NetEase may change at any time; when it does, the plugin has to change too. Read the copyright and disclaimer at the end before using it.
 
+![MyGo Music home with the NetEase Cloud Music plugin](screenshots/mygo-music-home.png)
+
 ## Install
 
 Put the folder in the app's plugins directory — **Settings > Plugins > + > Show Plugins Folder** — or drop it in there.
@@ -84,9 +86,9 @@ The `X-antiCheatToken` in `eapi` is a constant from the client, and may change w
 
 **Not an official project.** This is a personal, third-party project. It is not affiliated with, endorsed by, sponsored by, or in any way connected to NetEase Cloud Music, NetEase, Inc. or its affiliates. It is not an official client, and it does not represent NetEase. The name "NetEase Cloud Music" is used only to say which service the plugin talks to. It is also not an official MyGo Music plugin, and has no affiliation with MyGo Music's author or maintainers.
 
-**Trademarks.** "NetEase Cloud Music", "网易云音乐" and the related names, logos, icons and interface designs are trademarks and/or copyrighted works of NetEase or their respective owners. Their use here is nominative, to refer to the service, and claims no rights. This repository contains no official assets, and claims no copyright in any of them.
+**Trademarks.** "NetEase Cloud Music", "网易云音乐" and the related names, logos, icons and interface designs are trademarks and/or copyrighted works of NetEase or their respective owners. Their use here is nominative, to refer to the service, and claims no rights. This repository claims no copyright in the third-party assets visible in the screenshot.
 
-**Content.** All music, audio, lyrics, translations, cover art, artist images, comments and other content reached through this plugin belong to NetEase Cloud Music and the respective rights holders — labels, songwriters, performers and others. This project does not store, host, mirror or distribute any of it. The plugin runs on your own computer, with your own account, asks NetEase's own API for data, and hands the playback address the service returns to the player. No content is shipped with this repository.
+**Content.** All music, audio, lyrics, translations, cover art, artist images, comments and other content reached through this plugin belong to NetEase Cloud Music and the respective rights holders — labels, songwriters, performers and others. Apart from the interface screenshot, this repository does not store, host, mirror or distribute any of it. The plugin runs on your own computer, with your own account, asks NetEase's own API for data, and hands the playback address the service returns to the player. The screenshot illustrates the interface; no audio or lyrics are shipped with this repository.
 
 **No circumvention.** The plugin does not offer, and does not attempt, cracking, ad removal, bypassing payment, membership or regional restrictions, bulk downloading, or exporting audio or lyrics. Whether a track plays, at what bitrate, and for how long as a preview is decided entirely by NetEase's servers from your account and region; the plugin only passes on what the service answers.
 
