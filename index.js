@@ -1,0 +1,964 @@
+// 网易云音乐, for personal use. The catalog is the API its website calls: most
+// of it is plain, and what changes your library, or asks for it, goes as the
+// website sends it, encrypted with a key made up here once rather than per
+// request, as the service only takes the key back out of the RSA that carried
+// it. A track plays from the address its player is handed, so nothing is
+// converted: the app plays that as it is. A session, signed in on NetEase's own
+// page in a window of the app, is what answers your library, and what makes VIP
+// songs play whole rather than their first 45 seconds.
+
+const site = "https://music.163.com";
+const webUA =
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+
+// What its website says with every request, so the service answers as the
+// desktop site does.
+const clientCookie = "os=pc; appver=8.9.70";
+
+function fail(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+// The session's cookies, as a Cookie header, kept in the plugin's storage.
+const cookie = () => host.storage.get("cookie") || "";
+
+function cookieValue(name) {
+  for (const part of cookie().split(";")) {
+    const at = part.indexOf("=");
+    if (at > 0 && part.slice(0, at).trim() === name) return part.slice(at + 1).trim();
+  }
+  return "";
+}
+
+function needAccount() {
+  if (!cookie()) throw fail("signIn", "请先登录网易云音乐：在设置 > 插件里点登录。");
+}
+
+function headers(extra) {
+  return {
+    "user-agent": webUA,
+    referer: `${site}/`,
+    origin: site,
+    cookie: cookie() ? `${cookie()}; ${clientCookie}` : clientCookie,
+    ...extra,
+  };
+}
+
+// Reading an answer, and saying what its error means.
+
+function check(body, what) {
+  const code = body.code;
+  if (code === undefined || code === 200) return body;
+  if (code === 301) throw fail("signIn", "网易云音乐需要登录后再做这件事");
+  const said = body.message || body.msg;
+  if (said && said !== "系统错误") throw new Error(`${what}：${said}`);
+  throw new Error(`${what}：网易云音乐说 ${code}`);
+}
+
+// The plain API the website uses for most of what it reads.
+async function api(path, params) {
+  const url = new URL(site + path);
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+  }
+  const res = await fetch(url.href, { headers: headers() });
+  if (!res.ok) throw new Error(`${path}: ${res.status}`);
+  return check(await res.json(), path);
+}
+
+// The encrypted half of it, for what the plain API won't do: liking, your
+// library, playlists, comments, saving.
+
+const presetKey = "0CoJUm6Qyw8W8jud";
+const signKey = "mygomusicnetease";
+const cbcIv = "0102030405060708";
+
+// Its RSA of signKey, padded the way its website pads it and worked out once:
+// the service doesn't care that the key is the same every time.
+const encSecKey =
+  "45444455c61d00fca7cbcefe0c02b432c6b5bba3596f088d887948034bdfaf041c51cd6d7796ac9a542e5f1456f11c47f9228ca81d71cf5bfd40756553fb531f3c1dda387a166ac5ea362b5b53cccdad1145689d1add3b0af61b17e1aea903c49dc0f8cb2a6e1f234f7df2a506063a31d123f3825220461ca6ef29141f9bf33e";
+
+// AES-128-CBC, which the runtime doesn't have, in the small way its requests
+// need: a block at a time, with the chaining around it.
+
+const xtime = (x) => ((x << 1) ^ (x & 0x80 ? 0x1b : 0)) & 0xff;
+
+// GF(2^8) as a log table, so the S-box is worked out instead of typed in:
+// 256 numbers are easy to get one wrong.
+const gfExp = new Uint8Array(512);
+const gfLog = new Uint8Array(256);
+{
+  let field = 1;
+  for (let i = 0; i < 255; i++) {
+    gfExp[i] = field;
+    gfLog[field] = i;
+    field ^= xtime(field);
+  }
+  for (let i = 255; i < 512; i++) gfExp[i] = gfExp[i - 255];
+}
+
+const sbox = new Uint8Array(256);
+for (let a = 0; a < 256; a++) {
+  const inverse = a ? gfExp[255 - gfLog[a]] : 0;
+  const rot = (n) => ((inverse << n) | (inverse >>> (8 - n))) & 0xff;
+  sbox[a] = inverse ^ rot(1) ^ rot(2) ^ rot(3) ^ rot(4) ^ 0x63;
+}
+
+const mul = (a, b) => {
+  let product = 0;
+  for (let i = 0; i < 8; i++) {
+    if (b & 1) product ^= a;
+    a = xtime(a);
+    b >>= 1;
+  }
+  return product;
+};
+
+function keySchedule(key) {
+  const words = new Uint8Array(176);
+  words.set(key);
+  let round = 1;
+  for (let at = 16; at < 176; at += 4) {
+    let t = [words[at - 4], words[at - 3], words[at - 2], words[at - 1]];
+    if (at % 16 === 0) {
+      t = [sbox[t[1]] ^ round, sbox[t[2]], sbox[t[3]], sbox[t[0]]];
+      round = xtime(round);
+    }
+    for (let i = 0; i < 4; i++) words[at + i] = words[at - 16 + i] ^ t[i];
+  }
+  return words;
+}
+
+function encryptBlock(schedule, input) {
+  const s = new Uint8Array(input);
+  for (let i = 0; i < 16; i++) s[i] ^= schedule[i];
+  for (let at = 1; at <= 10; at++) {
+    for (let i = 0; i < 16; i++) s[i] = sbox[s[i]];
+    // Rows shift left by their number, the state being column by column.
+    for (let row = 1; row < 4; row++) {
+      const line = [s[row], s[4 + row], s[8 + row], s[12 + row]];
+      for (let col = 0; col < 4; col++) s[4 * col + row] = line[(col + row) % 4];
+    }
+    if (at !== 10) {
+      for (let col = 0; col < 4; col++) {
+        const [a0, a1, a2, a3] = [s[4 * col], s[4 * col + 1], s[4 * col + 2], s[4 * col + 3]];
+        s[4 * col] = mul(a0, 2) ^ mul(a1, 3) ^ a2 ^ a3;
+        s[4 * col + 1] = a0 ^ mul(a1, 2) ^ mul(a2, 3) ^ a3;
+        s[4 * col + 2] = a0 ^ a1 ^ mul(a2, 2) ^ mul(a3, 3);
+        s[4 * col + 3] = mul(a0, 3) ^ a1 ^ a2 ^ mul(a3, 2);
+      }
+    }
+    for (let i = 0; i < 16; i++) s[i] ^= schedule[at * 16 + i];
+  }
+  return s;
+}
+
+const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function toBase64(bytes) {
+  let out = "";
+  for (let at = 0; at < bytes.length; at += 3) {
+    const a = bytes[at];
+    const b = at + 1 < bytes.length ? bytes[at + 1] : 0;
+    const c = at + 2 < bytes.length ? bytes[at + 2] : 0;
+    const n = (a << 16) | (b << 8) | c;
+    out += base64Alphabet[(n >> 18) & 63] + base64Alphabet[(n >> 12) & 63];
+    out += at + 1 < bytes.length ? base64Alphabet[(n >> 6) & 63] : "=";
+    out += at + 2 < bytes.length ? base64Alphabet[n & 63] : "=";
+  }
+  return out;
+}
+
+const utf8 = new TextEncoder();
+
+function aesCbc(key, text) {
+  const schedule = keySchedule(utf8.encode(key));
+  const bytes = [...utf8.encode(text)];
+  const pad = 16 - (bytes.length % 16);
+  for (let i = 0; i < pad; i++) bytes.push(pad);
+  let previous = utf8.encode(cbcIv);
+  const out = [];
+  for (let at = 0; at < bytes.length; at += 16) {
+    const block = bytes.slice(at, at + 16).map((b, i) => b ^ previous[i]);
+    previous = encryptBlock(schedule, block);
+    for (const b of previous) out.push(b);
+  }
+  return toBase64(new Uint8Array(out));
+}
+
+const paramsOf = (payload) => aesCbc(signKey, aesCbc(presetKey, JSON.stringify(payload)));
+
+async function weapi(path, payload) {
+  const body = new URLSearchParams();
+  body.set("params", paramsOf({ csrf_token: cookieValue("__csrf"), ...payload }));
+  body.set("encSecKey", encSecKey);
+  const res = await fetch(`${site}${path}`, {
+    method: "POST",
+    headers: headers({ "content-type": "application/x-www-form-urlencoded" }),
+    body: body.toString(),
+  });
+  if (!res.ok) throw new Error(`${path}: ${res.status}`);
+  return check(await res.json(), path);
+}
+
+// The other form, eapi, which its apps use for what the website's encryption
+// no longer gets through: AES-ECB once, in hex, with an MD5 of the text
+// inside, and the caller's fields in the payload as `header`.
+
+const apiUA = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
+const eapiKey = "e82ckenh8dichen8";
+
+// Its anti-cheat token, which saving a playlist has to carry.
+const checkToken =
+  "9ca17ae2e6ffcda170e2e6ee8af14fbabdb988f225b3868eb2c15a879b9a83d274a790ac8ff54a97b889d5d42af0feaec3b92af58cff99c470a7eafd88f75e839a9ea7c14e909da883e83fb692a3abdb6b92adee9e";
+
+// The device the service thinks these come from, kept for as long as the
+// plugin is installed.
+let device = null;
+
+function deviceId() {
+  if (device) return device;
+  device = host.storage.get("deviceId") || "";
+  if (!device) {
+    for (let i = 0; i < 32; i++) device += "0123456789abcdef"[Math.floor(Math.random() * 16)];
+    host.storage.set("deviceId", device);
+  }
+  return device;
+}
+
+function eapiHeader() {
+  return {
+    osver: "Microsoft-Windows-10-Professional-build-19045-64bit",
+    deviceId: deviceId(),
+    os: "pc",
+    appver: "3.1.17.204416",
+    versioncode: "140",
+    mobilename: "",
+    buildver: String(Date.now()).slice(0, 10),
+    resolution: "1920x1080",
+    __csrf: cookieValue("__csrf"),
+    channel: "netease",
+    requestId: `${Date.now()}_${String(Math.floor(Math.random() * 1000)).padStart(4, "0")}`,
+  };
+}
+
+async function eapi(uri, payload, antiCheat) {
+  const header = eapiHeader();
+  if (antiCheat) header["X-antiCheatToken"] = checkToken;
+  const cookieParts = { ...header };
+  const session = cookieValue("MUSIC_U");
+  if (session) cookieParts.MUSIC_U = session;
+  const anonymous = cookieValue("MUSIC_A");
+  if (anonymous) cookieParts.MUSIC_A = anonymous;
+  const text = JSON.stringify({ ...payload, header, e_r: false });
+  const digest = host.crypto.md5(`nobody${uri}use${text}md5forencrypt`);
+  const params = host.crypto.aesEcbEncrypt(eapiKey, `${uri}-36cd479b6b5-${text}-36cd479b6b5-${digest}`).toUpperCase();
+  const res = await fetch(`${site}/eapi/${uri.slice(5)}`, {
+    method: "POST",
+    headers: {
+      "user-agent": apiUA,
+      "content-type": "application/x-www-form-urlencoded",
+      cookie: Object.entries(cookieParts)
+        .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+        .join("; "),
+    },
+    body: `params=${encodeURIComponent(params)}`,
+  });
+  if (!res.ok) throw new Error(`${uri}: ${res.status}`);
+  return check(await res.json(), uri);
+}
+
+// Answers, as the app knows them.
+
+const dateOf = (ms) => {
+  if (!ms) return undefined;
+  // The service dates things in China's day, which is ours eight hours on.
+  return new Date(Number(ms) + 8 * 3600 * 1000).toISOString().slice(0, 10);
+};
+
+// Covers come over http from the service, which serves them over https too.
+const pictureOf = (url) => (url ? String(url).replace(/^http:\/\//, "https://") : undefined);
+
+const artistOf = (a) => ({
+  id: String(a.id ?? ""),
+  name: a.name || "",
+  imageUrl: pictureOf(a.picUrl),
+});
+
+const albumOf = (a) =>
+  a ? { id: String(a.id ?? ""), name: a.name || "", imageUrl: pictureOf(a.picUrl) } : { id: "", name: "" };
+
+function albumEntryOf(a) {
+  return {
+    id: String(a.id ?? ""),
+    name: a.name || "",
+    imageUrl: pictureOf(a.picUrl || a.blurPicUrl),
+    artists: (a.artists || (a.artist ? [a.artist] : [])).map(artistOf),
+    released: dateOf(a.publishTime),
+  };
+}
+
+// A track whose copyright is gone is still listed, greyed out, as its website
+// lists it.
+function unavailableOf(s) {
+  return Boolean(s.st < 0 || s.status < 0 || s.noCopyrightRcmd || (s.privilege && s.privilege.st < 0));
+}
+
+function trackOf(s) {
+  if (!s || !s.id) return null;
+  return {
+    id: String(s.id),
+    name: s.name || "",
+    artists: (s.ar || s.artists || []).map(artistOf),
+    album: albumOf(s.al || s.album),
+    duration: Number(s.dt || s.duration || 0),
+    url: `${site}/song?id=${s.id}`,
+    unavailable: unavailableOf(s) || undefined,
+  };
+}
+
+const tracksOf = (list) => (list || []).map(trackOf).filter(Boolean);
+
+// Who is signed in, if anyone: the app asks this to know whether to offer it.
+
+let me = null;
+let meAt = 0;
+let meId = "";
+
+async function current() {
+  if (!cookie()) return null;
+  if (me && Date.now() - meAt < 5 * 60 * 1000) return me;
+  let r;
+  try {
+    r = await api("/api/nuser/account/get");
+  } catch (e) {
+    // A session the service turned down is no session: what asked for it can
+    // ask the listener to sign in again.
+    if (e.code === "signIn") {
+      endSession();
+      return null;
+    }
+    throw e;
+  }
+  const profile = r.profile;
+  if (!profile) return null;
+  me = {
+    id: String(profile.userId),
+    name: profile.nickname || (r.account && r.account.userName) || "",
+    imageUrl: pictureOf(profile.avatarUrl),
+  };
+  meId = me.id;
+  meAt = Date.now();
+  return me;
+}
+
+export async function account() {
+  return current();
+}
+
+// Signing in is on NetEase's own page, in a window of the app, as its website
+// does it: a code scanned from the phone, or a number and a password.
+
+const browserUA =
+  host.platform === "darwin"
+    ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+    : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
+
+export async function signIn() {
+  const { cookie: session } = await host.webSignIn({
+    url: `${site}/#/login`,
+    cookiesOf: site,
+    until: ["MUSIC_U"],
+    userAgent: browserUA,
+  });
+  host.storage.set("cookie", session);
+  me = null;
+  meAt = 0;
+  meId = "";
+  const who = await current();
+  if (!who) {
+    endSession();
+    throw new Error("网易云音乐没有接受这次登录，请再试一次。");
+  }
+  return who;
+}
+
+export function signOut() {
+  endSession();
+}
+
+function endSession() {
+  host.storage.remove("cookie");
+  me = null;
+  meAt = 0;
+  meId = "";
+  likedCache = null;
+  savedAlbumCache = null;
+}
+
+// Pages.
+
+export async function home() {
+  const [daily, mixes, fresh, charts] = await Promise.all([
+    quietly(dailySongs(), []),
+    quietly(recommendedPlaylists(), []),
+    quietly(newSongs(), []),
+    quietly(chartPlaylists(8), []),
+  ]);
+  const sections = [];
+  // Signed out, its daily list is still a list of songs worth starting on.
+  if (daily.length) sections.push({ title: cookie() ? "每日推荐" : "今日推荐", tracks: daily, morePage: "daily" });
+  if (mixes.length) sections.push({ title: "推荐歌单", playlists: mixes });
+  if (fresh.length) sections.push({ title: "新歌速递", tracks: fresh });
+  if (charts.length) sections.push({ title: "排行榜", playlists: charts, morePage: "charts" });
+  return { title: "网易云音乐", sections };
+}
+
+async function quietly(work, fallback) {
+  try {
+    return await work;
+  } catch (e) {
+    console.warn(`网易云音乐: ${e.message}`);
+    return fallback;
+  }
+}
+
+async function dailySongs() {
+  const r = await weapi("/weapi/v3/discovery/recommend/songs", {});
+  return tracksOf((r.data && (r.data.dailySongs || r.data.recommend)) || r.recommend);
+}
+
+async function recommendedPlaylists() {
+  const r = await api("/api/personalized/playlist", { limit: 12 });
+  return (r.result || []).map(playlistOf);
+}
+
+async function newSongs() {
+  const r = await api("/api/personalized/newsong", { type: "recommend" });
+  return (r.result || [])
+    .map((item) => {
+      const track = trackOf(item.song || item);
+      if (track && item.picUrl && !track.album.imageUrl) track.album = { ...track.album, imageUrl: pictureOf(item.picUrl) };
+      return track;
+    })
+    .filter(Boolean);
+}
+
+async function chartPlaylists(limit) {
+  const r = await api("/api/toplist/detail");
+  return (r.list || []).slice(0, limit).map((l) => ({
+    id: String(l.id),
+    name: l.name || "",
+    imageUrl: pictureOf(l.coverImgUrl),
+    trackCount: l.trackCount || undefined,
+    description: l.updateFrequency || undefined,
+  }));
+}
+
+async function newAlbums(limit) {
+  const r = await api("/api/album/new", { area: "ALL", limit, offset: 0 });
+  return (r.albums || []).map(albumEntryOf);
+}
+
+export async function browse({ page }) {
+  if (page === "charts") {
+    const charts = await chartPlaylists();
+    return {
+      title: "排行榜",
+      subtitle: "网易云音乐的榜单，跟着它们更新",
+      sections: [{ title: "全部榜单", playlists: charts }],
+    };
+  }
+  if (page === "new") {
+    const [songs, albums] = await Promise.all([newSongs(), newAlbums(24)]);
+    const sections = [];
+    if (songs.length) sections.push({ title: "新歌速递", tracks: songs });
+    if (albums.length) sections.push({ title: "新碟上架", albums });
+    return { title: "新歌新碟", sections };
+  }
+  if (page === "daily") {
+    const songs = await dailySongs();
+    return { title: cookie() ? "每日推荐" : "今日推荐", subtitle: "今天为你挑的歌", sections: [{ tracks: songs }] };
+  }
+  if (page === "playlists" || page.startsWith("playlists:")) {
+    const at = page.indexOf(":");
+    return playlistSquare(at < 0 ? "全部" : page.slice(at + 1));
+  }
+  throw fail("unavailable", `没有这个页面：${page}`);
+}
+
+const categories = ["全部", "华语", "欧美", "日语", "韩语", "粤语", "流行", "摇滚", "民谣", "电子", "说唱", "轻音乐", "爵士", "古典", "影视原声", "二次元", "怀旧", "治愈"];
+
+async function playlistSquare(category) {
+  const r = await api("/api/playlist/list", { cat: category, order: "hot", limit: 30, offset: 0 });
+  const playlists = (r.playlists || []).map(playlistOf);
+  return {
+    title: category === "全部" ? "歌单广场" : `${category}歌单`,
+    sections: [
+      { title: "分类", links: categories.map((name) => ({ title: name, page: `playlists:${name}` })) },
+      { title: category === "全部" ? "热门歌单" : `热门${category}歌单`, playlists },
+    ],
+  };
+}
+
+// Search. Each kind has its type, which the service numbers rather than names.
+
+const searchTypes = { tracks: 1, albums: 10, artists: 100, playlists: 1000 };
+const searchPage = 30;
+
+export async function search({ query, kind, offset }) {
+  const type = searchTypes[kind];
+  if (!type) return { [kind]: [], more: false };
+  const r = await api("/api/search/get", { s: query, type, limit: searchPage, offset });
+  const result = r.result || {};
+  const out = { more: false };
+  if (kind === "tracks") {
+    out.tracks = tracksOf(result.songs);
+    out.more = offset + out.tracks.length < (result.songCount || 0);
+  } else if (kind === "albums") {
+    out.albums = (result.albums || []).map(albumEntryOf);
+    out.more = offset + out.albums.length < (result.albumCount || 0);
+  } else if (kind === "artists") {
+    out.artists = (result.artists || []).map(artistOf);
+    out.more = offset + out.artists.length < (result.artistCount || 0);
+  } else {
+    out.playlists = (result.playlists || []).map(playlistOf);
+    out.more = offset + out.playlists.length < (result.playlistCount || 0);
+  }
+  return out;
+}
+
+export async function suggest({ query }) {
+  if (!query) return [];
+  try {
+    const r = await api("/api/search/suggest/web", { csrf_token: "", s: query });
+    const result = r.result || {};
+    const out = [];
+    for (const kind of result.order || ["songs", "artists", "albums", "playlists"]) {
+      for (const item of result[kind] || []) {
+        const name = item.name || item.keyword;
+        if (name && !out.includes(name)) out.push(name);
+        if (out.length >= 8) return out;
+      }
+    }
+    return out;
+  } catch (e) {
+    const r = await api("/api/search/suggest/keyword", { s: query });
+    return (r.result && r.result.allMatch ? r.result.allMatch : []).map((m) => m.keyword).filter(Boolean).slice(0, 8);
+  }
+}
+
+// Albums and artists.
+
+export async function album({ id }) {
+  const [r, saved] = await Promise.all([api(`/api/v1/album/${id}`), savedAlbumIds()]);
+  const a = r.album || {};
+  return {
+    album: { ...albumEntryOf(a), saved: saved.has(String(id)) || undefined },
+    tracks: tracksOf(r.songs),
+  };
+}
+
+export async function artist({ id }) {
+  const [detail, albums] = await Promise.all([
+    api(`/api/v1/artist/${id}`),
+    api(`/api/artist/albums/${id}`, { limit: 12, offset: 0 }),
+  ]);
+  const a = detail.artist || {};
+  return {
+    artist: {
+      id: String(a.id ?? id),
+      name: a.name || "",
+      imageUrl: pictureOf(a.picUrl),
+      following: Boolean(a.followed) || undefined,
+    },
+    tracks: tracksOf(detail.hotSongs).slice(0, 20),
+    albums: (albums.hotAlbums || []).map(albumEntryOf),
+  };
+}
+
+// Playlists and the library.
+
+function playlistOf(p) {
+  const creator = p.creator || {};
+  const ownerId = String(p.userId ?? creator.userId ?? "");
+  return {
+    id: String(p.id),
+    name: p.name || "",
+    imageUrl: pictureOf(p.coverImgUrl || p.picUrl),
+    description: p.description || undefined,
+    owner: creator.nickname || undefined,
+    trackCount: p.trackCount || undefined,
+    mine: Boolean(meId && ownerId && ownerId === meId) || undefined,
+    saved: p.subscribed === true || undefined,
+  };
+}
+
+// A playlist comes with its first thousand tracks; the rest are asked for by
+// id, and the playlist's own order is put back over both.
+
+async function inOrder(playlist) {
+  const tracks = tracksOf(playlist.tracks);
+  const ids = (playlist.trackIds || []).map((t) => String(t.id));
+  if (!ids.length || ids.length <= tracks.length) return tracks;
+  const known = new Map(tracks.map((t) => [t.id, t]));
+  const missing = ids.filter((id) => !known.has(id));
+  for (const track of await songsById(missing.slice(0, 5000))) known.set(track.id, track);
+  return ids.map((id) => known.get(id)).filter(Boolean);
+}
+
+async function songsById(ids) {
+  const out = [];
+  const numbers = ids.map(Number).filter((id) => Number.isFinite(id));
+  for (let at = 0; at < numbers.length; at += 500) {
+    const c = JSON.stringify(numbers.slice(at, at + 500).map((id) => ({ id })));
+    const r = await api("/api/v3/song/detail", { c });
+    out.push(...tracksOf(r.songs));
+  }
+  return out;
+}
+
+export async function playlist({ id }) {
+  // Which playlists are the listener's own is known once the account is.
+  if (cookie() && !meId) await quietly(current(), null);
+  const r = await api("/api/v6/playlist/detail", { id, n: 1000 });
+  const p = r.playlist || {};
+  return { ...playlistOf(p), tracks: await inOrder(p) };
+}
+
+// The app loads this for its sidebar as it starts: no account is no playlists,
+// rather than asking someone who's only browsing to sign in.
+export async function playlists() {
+  if (!cookie()) return [];
+  const who = await current();
+  if (!who) return [];
+  const r = await api("/api/user/playlist", { uid: who.id, limit: 1000, offset: 0 });
+  // Liked Music has a page of its own, and its entries are liked songs.
+  return (r.playlist || []).filter((p) => p.specialType !== 5).map(playlistOf);
+}
+
+// What the listener liked, which the service answers as ids alone.
+
+let likedCache = null;
+let likedAt = 0;
+const likedFor = 5 * 60 * 1000;
+
+async function likedIds() {
+  if (!cookie()) return [];
+  if (likedCache && Date.now() - likedAt < likedFor) return likedCache;
+  const who = await current();
+  if (!who) throw fail("signIn", "登录已经失效，请重新登录。");
+  const r = await eapi("/api/song/like/get", { uid: Number(who.id) });
+  likedCache = (r.ids || (r.data && r.data.ids) || []).map(String);
+  likedAt = Date.now();
+  return likedCache;
+}
+
+export async function liked({ offset }) {
+  needAccount();
+  const ids = await likedIds();
+  const page = ids.slice(offset, offset + 50);
+  const byId = new Map((await songsById(page)).map((t) => [t.id, t]));
+  return { tracks: page.map((id) => byId.get(id)).filter(Boolean), more: offset + page.length < ids.length };
+}
+
+export async function isLiked({ ids }) {
+  const set = new Set(cookie() ? await likedIds() : []);
+  return Object.fromEntries(ids.map((id) => [String(id), set.has(String(id))]));
+}
+
+export async function like({ id, on }) {
+  needAccount();
+  await weapi("/weapi/radio/like", { alg: "itembased", trackId: Number(id), like: Boolean(on), time: "3" });
+  if (likedCache) {
+    const key = String(id);
+    likedCache = on ? [key, ...likedCache.filter((x) => x !== key)] : likedCache.filter((x) => x !== key);
+  }
+}
+
+// What was played: the app's own list of it, and the service's when signed in.
+
+export function played({ id }) {
+  host.storage.set("lastPlayed", id);
+  const stored = host.storage.get("recent");
+  const list = (Array.isArray(stored) ? stored : []).filter((x) => x !== id);
+  list.unshift(id);
+  host.storage.set("recent", list.slice(0, 100));
+}
+
+export async function recent() {
+  const stored = host.storage.get("recent");
+  const local = (Array.isArray(stored) ? stored : []).map(String);
+  const out = [];
+  const seen = new Set();
+  if (local.length) {
+    const lately = local.slice(0, 60);
+    const byId = new Map((await quietly(songsById(lately), [])).map((t) => [t.id, t]));
+    for (const id of lately) {
+      const track = byId.get(id);
+      if (track && !seen.has(track.id)) {
+        seen.add(track.id);
+        out.push(track);
+      }
+    }
+  }
+  if (cookie()) {
+    try {
+      const who = await current();
+      const r = await weapi("/weapi/v1/play/record", { uid: Number(who.id), type: 1 });
+      for (const item of [...(r.allData || []), ...(r.weekData || [])]) {
+        if (out.length >= 100) break;
+        const track = item.song ? trackOf(item.song) : null;
+        if (track && !seen.has(track.id)) {
+          seen.add(track.id);
+          out.push(track);
+        }
+      }
+    } catch (e) {
+      console.warn(`网易云音乐的播放记录: ${e.message}`);
+    }
+  }
+  return out.slice(0, 100);
+}
+
+// Radio: what the service thinks follows from what plays, and the songs most
+// like it, for when it has nothing to go on.
+
+export function stations() {
+  return [
+    { id: "radio", name: "私人漫游", description: "按你常听的歌，一直播下去。" },
+    { id: "similar", name: "相似歌曲", description: "接着上一首，播和它像的歌。" },
+  ];
+}
+
+export async function stationNext({ id }) {
+  if (id === "radio" && cookie()) {
+    try {
+      const r = await weapi("/weapi/v1/radio/get", {});
+      const songs = tracksOf(r.data).slice(0, 30);
+      if (songs.length >= 5) return songs;
+      const seed = songs.length ? songs[songs.length - 1].id : await seedOf();
+      return [...songs, ...(await similarTo(seed, 30 - songs.length))];
+    } catch (e) {
+      console.warn(`私人漫游: ${e.message}`);
+    }
+  }
+  return similarTo(await seedOf(), 30);
+}
+
+async function seedOf() {
+  const last = host.storage.get("lastPlayed");
+  if (last) return String(last);
+  const songs = await quietly(newSongs(), []);
+  if (!songs.length) return "";
+  return songs[Math.floor(Math.random() * songs.length)].id;
+}
+
+async function similarTo(seed, limit) {
+  if (!seed) return [];
+  const r = await api("/api/discovery/simiSong", { songid: seed, limit: 50 });
+  return tracksOf(r.songs).filter((t) => t.id !== String(seed)).slice(0, limit);
+}
+
+// Comments, which is half of what NetEase is to people.
+
+const threadOf = (trackId) => `R_SO_4_${trackId}`;
+
+function commentOf(c) {
+  return {
+    id: String(c.commentId),
+    author: (c.user && c.user.nickname) || "",
+    avatarUrl: pictureOf(c.user && c.user.avatarUrl),
+    text: c.content || "",
+    time: c.time || undefined,
+    likes: c.likedCount || undefined,
+    liked: Boolean(c.liked) || undefined,
+  };
+}
+
+export async function comments({ trackId, offset }) {
+  const r = await api(`/api/v1/resource/comments/${threadOf(trackId)}`, { limit: 20, offset });
+  // The hot ones come with every page, and belong at the top of the first.
+  const raw = offset === 0 ? [...(r.hotComments || []), ...(r.comments || [])] : r.comments || [];
+  const seen = new Set();
+  const list = [];
+  for (const c of raw) {
+    const id = String(c.commentId);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    list.push(commentOf(c));
+  }
+  return { comments: list, total: r.total || undefined, more: Boolean(r.more) };
+}
+
+export async function likeComment({ trackId, commentId, on }) {
+  needAccount();
+  await weapi("/weapi/v1/comment/like", { threadId: threadOf(trackId), commentId: Number(commentId), like: Boolean(on) });
+}
+
+export async function postComment({ trackId, text }) {
+  needAccount();
+  const r = await weapi("/weapi/resource/comments/add", { threadId: threadOf(trackId), content: text });
+  const c = r.comment || {};
+  return {
+    id: String(c.commentId || Date.now()),
+    author: (c.user && c.user.nickname) || (me && me.name) || "",
+    text: c.content || text,
+    time: c.time || Date.now(),
+  };
+}
+
+// Lyrics, as LRC and its translation, which the app times itself.
+
+export async function lyrics({ id }) {
+  const r = await api("/api/song/lyric", { id, lv: -1, kv: -1, tv: -1 });
+  return {
+    lrc: (r.lrc && r.lrc.lyric) || "",
+    translation: (r.tlyric && r.tlyric.lyric) || undefined,
+  };
+}
+
+// Playing.
+
+// The levels the service names its audio by, and what each is here.
+const levels = {
+  standard: { level: "standard", encode: "mp3" },
+  high: { level: "exhigh", encode: "mp3" },
+  lossless: { level: "lossless", encode: "flac" },
+};
+
+async function audioOf(id, level, encode) {
+  const r = await api("/api/song/enhance/player/url/v1", { ids: `[${id}]`, level, encodeType: encode });
+  const found = (r.data || [])[0];
+  return found && found.url ? found : null;
+}
+
+const qualityOf = (d) =>
+  d.level === "lossless" || d.level === "hires" || d.level === "jymaster" ? "lossless" : d.level === "exhigh" ? "high" : "standard";
+
+const finite = (v) => (typeof v === "number" && Number.isFinite(v) ? v : undefined);
+
+export async function stream({ id, quality }) {
+  const asked = levels[quality] || levels.standard;
+  let found = null;
+  // A level the listener's membership doesn't reach comes back as a lower one,
+  // or as nothing: the one below it is worth trying.
+  for (const step of [asked, levels.high, levels.standard]) {
+    found = await audioOf(id, step.level, step.encode);
+    if (found) break;
+  }
+  if (!found) throw fail("unavailable", "这首歌没有可播放的地址：可能已下架，或者需要会员。");
+  return {
+    url: found.url,
+    type: found.type === "flac" ? "flac" : "mp3",
+    quality: qualityOf(found),
+    bitRate: found.br || undefined,
+    size: found.size || undefined,
+    gain: finite(found.gain),
+    peak: finite(found.peak),
+  };
+}
+
+// Making and keeping playlists, saving albums, following artists: the half of
+// the service that takes a session.
+
+export async function createPlaylist({ name }) {
+  needAccount();
+  const r = await weapi("/weapi/playlist/create", { name, privacy: "0", type: "NORMAL" });
+  const p = r.playlist || {};
+  return { id: String(p.id || r.id || ""), name: p.name || name, mine: true, trackCount: 0, tracks: [] };
+}
+
+export async function renamePlaylist({ id, name }) {
+  needAccount();
+  await eapi("/api/playlist/update/name", { id: Number(id), name });
+}
+
+export async function deletePlaylist({ id }) {
+  needAccount();
+  await weapi("/weapi/playlist/remove", { ids: JSON.stringify([Number(id)]) });
+}
+
+// The ids go as strings, as its own apps send them.
+const trackIdsOf = (trackIds) => JSON.stringify(trackIds.map(String));
+
+export async function addToPlaylist({ id, trackIds }) {
+  needAccount();
+  await eapi("/api/playlist/manipulate/tracks", {
+    op: "add",
+    pid: String(id),
+    trackIds: trackIdsOf(trackIds),
+    imme: "true",
+  });
+}
+
+export async function removeFromPlaylist({ id, trackIds }) {
+  needAccount();
+  await eapi("/api/playlist/manipulate/tracks", {
+    op: "del",
+    pid: String(id),
+    trackIds: trackIdsOf(trackIds),
+    imme: "true",
+  });
+}
+
+// Moving a track is the playlist's whole order, written again without it.
+export async function movePlaylistTrack({ id, from, to }) {
+  needAccount();
+  const r = await api("/api/v6/playlist/detail", { id, n: 1000 });
+  const ids = ((r.playlist && r.playlist.trackIds) || []).map((t) => t.id);
+  if (from < 0 || from >= ids.length || to < 0 || to >= ids.length) throw new Error("这首歌不在这个歌单里。");
+  ids.splice(to, 0, ids.splice(from, 1)[0]);
+  await weapi("/weapi/playlist/order/update", { ids: JSON.stringify(ids) });
+}
+
+export async function savePlaylist({ id, on }) {
+  needAccount();
+  await eapi(`/api/playlist/${on ? "subscribe" : "unsubscribe"}`, { id: Number(id) }, true);
+}
+
+export async function followArtist({ id, on }) {
+  needAccount();
+  await weapi(`/weapi/artist/${on ? "sub" : "unsub"}`, {
+    artistId: Number(id),
+    artistIds: JSON.stringify([Number(id)]),
+  });
+}
+
+export async function saveAlbum({ id, on }) {
+  needAccount();
+  await weapi(`/weapi/album/${on ? "sub" : "unsub"}`, { id: Number(id) });
+  savedAlbumCache = null;
+}
+
+// The albums saved are a list of their own, and what a page asks to know
+// whether its album is in it.
+
+let savedAlbumCache = null;
+let savedAlbumAt = 0;
+const savedAlbumFor = 5 * 60 * 1000;
+
+const albumListOf = (r) => (Array.isArray(r.data) ? r.data : Array.isArray(r.albums) ? r.albums : []);
+
+async function savedAlbumIds() {
+  if (!cookie()) return new Set();
+  if (savedAlbumCache && Date.now() - savedAlbumAt < savedAlbumFor) return savedAlbumCache;
+  const set = new Set();
+  try {
+    const r = await weapi("/weapi/album/sublist", { limit: 1000, offset: 0, total: true });
+    for (const a of albumListOf(r)) set.add(String(a.id || a.albumId));
+  } catch (e) {
+    console.warn(`收藏的专辑: ${e.message}`);
+  }
+  savedAlbumCache = set;
+  savedAlbumAt = Date.now();
+  return set;
+}
+
+export async function savedAlbums({ offset }) {
+  needAccount();
+  const r = await weapi("/weapi/album/sublist", { limit: 25, offset, total: true });
+  return { albums: albumListOf(r).map(albumEntryOf), more: Boolean(r.hasMore ?? r.more) };
+}
