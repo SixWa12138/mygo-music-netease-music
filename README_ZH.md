@@ -1,4 +1,4 @@
-[English](README.en.md) | 中文
+[English](README.md) | 中文
 
 # 网易云音乐 for MyGo Music
 

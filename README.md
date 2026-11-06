@@ -1,4 +1,4 @@
-English | [中文](README.md)
+English | [中文](README_ZH.md)
 
 # NetEase Cloud Music for MyGo Music
 
