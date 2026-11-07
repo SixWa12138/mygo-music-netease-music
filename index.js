@@ -620,7 +620,10 @@ function episodeOf(program) {
     album: { id: "", name: radio.name || "", imageUrl: pictureOf(program.coverUrl || radio.picUrl) },
     duration: Number(program.duration || song.duration || song.dt || 0),
     showId: String(radio.id || ""),
-    description: program.description || program.programDesc || undefined,
+    description:
+      (typeof program.description === "string" && program.description) ||
+      (typeof program.programDesc === "string" && program.programDesc) ||
+      undefined,
     published: dateOf(program.createTime),
     url: `${site}/program?id=${program.id}`,
     unavailable: !song.id || song.status < 0 || song.st < 0 || undefined,

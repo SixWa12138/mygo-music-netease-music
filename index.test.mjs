@@ -368,7 +368,11 @@ test("podcast episodes keep their program identity while playing the underlying 
     if (url.pathname === "/eapi/dj/program/byradio") {
       assert.equal(body.radioId, 8);
       assert.equal(body.offset, 30);
-      return { code: 200, programs: [program], more: true };
+      return {
+        code: 200,
+        programs: [program, { ...program, id: 100, description: [{ text: "Rich text" }] }],
+        more: true,
+      };
     }
     if (url.pathname === "/eapi/dj/program/detail") {
       assert.equal(body.id, 99);
@@ -380,6 +384,9 @@ test("podcast episodes keep their program identity while playing the underlying 
   });
   const page = await plugin.show({ id: "8", offset: 30 });
   const track = page.episodes[0];
+  assert.equal(track.description, "Description");
+  assert.equal(page.episodes[1].description, undefined);
+  assert.equal(JSON.parse(JSON.stringify(page)).episodes[1].description, undefined);
   assert.equal(track.id, "dj:99");
   assert.equal(track.showId, "8");
   assert.equal(track.duration, 180000);
