@@ -57,13 +57,13 @@ Plays are not reported back to NetEase, so its own listening charts don't move. 
 
 Discovery, charts, new releases, playlists, podcasts and radio appear above a divider. Liked songs, saved albums, subscribed podcasts and the music cloud follow the divider, with the created and saved playlist groups and their lists beneath those navigation entries.
 
-MyGo Music 0.1.13 originally has no plugin support for dividers or positioning playlist groups. The [host sidebar patch](patches/mygo-sidebar.patch) adds this support; the local build is `0.1.13+sidebar.2`. The stock player can still open the new pages, but the full grouping and order require the patch, which may need reapplying after a player update.
+The player needs to support plugin sidebar dividers and positioned playlist groups to show this order. The [host sidebar patch](patches/mygo-sidebar.patch) is one implementation; a player without these interfaces can still open ordinary plugin pages, but cannot show the divider or place playlist groups here.
 
 The companion build also includes a [dynamic liked cover patch](patches/mygo-liked-cover.patch). Liked Songs uses the first song's album artwork and updates after successful likes or unlikes in this app. Empty lists and missing, loading or failed artwork show the heart placeholder.
 
 ## Cloud uploads and podcast tabs
 
-Plugin 0.4.0 needs the [cloud library host patch](patches/mygo-cloud-library.patch) for its four podcast tabs and upload controls. The local build is `0.1.13+cloud.1`, retaining the sidebar and dynamic liked-cover patches.
+The four podcast tabs and cloud upload button use the player's browse-tab, native file-picker and upload interfaces. The [cloud library host patch](patches/mygo-cloud-library.patch) is one implementation of these interfaces; the plugin does not require a particular player version as long as those interfaces remain compatible. If the controls disappear after an update, the player is no longer exposing the corresponding browse or upload capability to the plugin.
 
 Upload Music accepts multiple MP3, AAC, WMA, WAV, OGG, M4A, APE, FLAC and CUE files. CUE sheets (including `.flac.cue`) split at TRACK / INDEX 01 boundaries. Each track is uploaded as a temporary FLAC with its title, artist, album and track number, then the temporary file is removed. Duplicate selections of the same track are deduplicated. References stay within the sheet's directory; choose audio elsewhere directly.
 

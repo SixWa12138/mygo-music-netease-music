@@ -763,7 +763,7 @@ async function cloudPage(offset) {
 // The host streams only the file selected in its native picker, without loading it into JavaScript.
 export async function upload({ file }) {
   needAccount();
-  if (!host.uploadFile || !host.uploadCheckpoint) throw fail("unsupported", "请安装支持云盘上传的 MyGo Music 配套版本。");
+  if (!host.uploadFile || !host.uploadCheckpoint) throw fail("unsupported", "当前播放器没有提供云盘上传能力。");
   const mimeTypes = { mp3: "audio/mpeg", aac: "audio/aac", wma: "audio/x-ms-wma", wav: "audio/wav", ogg: "audio/ogg", m4a: "audio/mp4", ape: "audio/x-ape", flac: "audio/flac" };
   const ext = file?.name?.split(".").pop().toLowerCase();
   if (!file || !/^[a-f0-9]{32}$/i.test(file.md5) || !Number.isSafeInteger(file.size) || file.size <= 0 || !Object.hasOwn(mimeTypes, ext)) {
