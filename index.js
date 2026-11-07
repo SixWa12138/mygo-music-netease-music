@@ -814,7 +814,8 @@ const searchPage = 30;
 export async function search({ query, kind, offset }) {
   const type = searchTypes[kind];
   if (!type) return { [kind]: [], more: false };
-  const r = await api("/api/search/get", { s: query, type, limit: searchPage, offset });
+  const path = kind === "tracks" ? "/api/cloudsearch/pc" : "/api/search/get";
+  const r = await api(path, { s: query, type, limit: searchPage, offset });
   const result = r.result || {};
   const out = { more: false };
   if (kind === "tracks") {

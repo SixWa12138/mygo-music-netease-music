@@ -44,6 +44,23 @@ function request(url, init) {
 
 const song = id => ({ id, name: `Song ${id}`, ar: [], al: {}, dt: 180000 });
 
+test("song search keeps album artwork from the fields returned by search", async () => {
+  const plugin = await setup(url => {
+    assert.equal(url.pathname, "/api/cloudsearch/pc");
+    return {
+      code: 200,
+      result: {
+        songCount: 1,
+        songs: [
+          { id: 1, name: "Primary", ar: [], album: { id: 11, name: "Album", picUrl: "http://p1.music.126.net/primary.jpg" } },
+        ],
+      },
+    };
+  });
+  const result = await plugin.search({ query: "song", kind: "tracks", offset: 0 });
+  assert.equal(result.tracks[0].album.imageUrl, "https://p1.music.126.net/primary.jpg");
+});
+
 // Each personal podcast tab must call its own client endpoint and keep its content playable.
 test("personal podcast tabs show created, purchased and liked content with pagination", async () => {
   const calls = [];
