@@ -962,7 +962,16 @@ async function likedIds() {
   const who = await current();
   if (!who) throw fail("signIn", "登录已经失效，请重新登录。");
   const r = await eapi("/api/song/like/get", { uid: Number(who.id) });
-  likedCache = (r.ids || (r.data && r.data.ids) || []).map(String);
+  const ids = (r.ids || (r.data && r.data.ids) || []).map(String);
+  const ordered = await quietly((async () => {
+    const lists = await api("/api/user/playlist", { uid: who.id, limit: 1000, offset: 0 });
+    const liked = (lists.playlist || []).find((p) => p.specialType === 5);
+    if (!liked) return [];
+    const detail = await api("/api/v6/playlist/detail", { id: liked.id, n: 1 });
+    return ((detail.playlist && detail.playlist.trackIds) || []).map((track) => String(track.id));
+  })(), []);
+  const known = new Set(ids);
+  likedCache = [...ordered.filter((id) => known.delete(id)), ...ids.filter((id) => known.delete(id))];
   likedAt = Date.now();
   return likedCache;
 }

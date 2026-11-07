@@ -155,10 +155,12 @@ const audio = (level = "exhigh") => ({
 
 // The web endpoint refused hearts; both directions must reach the client API and update the library.
 test("hearts add and remove a song in liked music", async () => {
-  const ids = new Set([7]);
+  const ids = new Set([42, 7]);
   const changes = [];
   const plugin = await setup((url, init) => {
     if (url.pathname === "/api/nuser/account/get") return { code: 200, profile: { userId: 9 } };
+    if (url.pathname === "/api/user/playlist") return { code: 200, playlist: [{ id: 90, specialType: 5 }] };
+    if (url.pathname === "/api/v6/playlist/detail") return { code: 200, playlist: { trackIds: [{ id: 7 }, { id: 42 }] } };
     if (url.pathname === "/api/v3/song/detail") {
       return { code: 200, songs: JSON.parse(url.searchParams.get("c")).map(({ id }) => song(id)) };
     }
@@ -176,7 +178,8 @@ test("hearts add and remove a song in liked music", async () => {
     else ids.delete(body.trackId);
     return { code: 200 };
   });
-  assert.deepEqual(await plugin.isLiked({ ids: ["42", "7"] }), { 42: false, 7: true });
+  assert.deepEqual(await plugin.isLiked({ ids: ["42", "7"] }), { 42: true, 7: true });
+  assert.deepEqual((await plugin.liked({ offset: 0 })).tracks.map(track => track.id), ["7", "42"]);
   await plugin.like({ id: "42", on: true });
   assert.ok(ids.has(42));
   assert.deepEqual(await plugin.isLiked({ ids: ["42", "7"] }), { 42: true, 7: true });
@@ -192,6 +195,8 @@ test("a rejected heart preserves the cached liked state", async () => {
   for (const code of [301, 405]) {
     const plugin = await setup((url, init) => {
       if (url.pathname === "/api/nuser/account/get") return { code: 200, profile: { userId: 9 } };
+      if (url.pathname === "/api/user/playlist") return { code: 200, playlist: [{ id: 90, specialType: 5 }] };
+      if (url.pathname === "/api/v6/playlist/detail") return { code: 200, playlist: { trackIds: [{ id: 42 }] } };
       request(url, init);
       return url.pathname === "/eapi/song/like/get" ? { code: 200, ids: [42] } : { code };
     });
