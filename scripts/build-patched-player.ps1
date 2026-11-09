@@ -56,6 +56,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "MyGo package tests failed." }
     & go test ./internal/app -run 'Test(PositionedSidebarGroups|SidebarPlaylistCollapse|NewPlaylistInCollapsedSidebar|NavigationIsTheSidebar|LikedCoverFollowsFirstSong|LikedPagePaging|LikeGoesBack|LikeFromPlayerBar|BrowseTabNavigation|UploadPickerAndBatch|CancelUploadBatch)$'
     if ($LASTEXITCODE -ne 0) { throw "MyGo UI regression tests failed." }
+    & go test ./internal/app -run '^TestArtist(ScrollPaging|PagingRetry|PersonalPageButton)$' -count=5
+    if ($LASTEXITCODE -ne 0) { throw "Artist pagination regression tests failed." }
     & go tool mygo build -platform windows/amd64 -skip-installer
     if ($LASTEXITCODE -ne 0) { throw "MyGo Windows build failed." }
 }

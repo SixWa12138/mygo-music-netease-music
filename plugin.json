@@ -1,7 +1,7 @@
 {
   "id": "netease-music",
   "name": "网易云音乐",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "main": "index.js",
   "playback": "stream",
   "permissions": {
@@ -40,6 +40,11 @@
     {
       "title": "我喜欢的音乐",
       "builtin": "liked"
+    },
+    {
+      "title": "最近播放",
+      "page": "recent",
+      "icon": "playlist"
     },
     {
       "builtin": "savedAlbums"

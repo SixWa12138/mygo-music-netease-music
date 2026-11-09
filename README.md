@@ -20,7 +20,7 @@ mygo-music://install-plugin?repo=SixWa12138/mygo-music-netease-music
 
 ## Signing in
 
-Click Sign In in **Settings > Plugins**: a QR code shows in the app. Scan it with the NetEase Cloud Music phone app, then confirm on the phone — that's the only way in.
+Click Sign In in **Settings > Plugins**: a QR code shows in the app. Scan it with the NetEase Cloud Music phone app, then confirm on the phone. QR generation and polling use the official PC client API (`eapi`, `type: 3`), as in [sogud/mygo-music-netease](https://github.com/sogud/mygo-music-netease).
 
 The session cookie (with `MUSIC_U`) is kept unencrypted in the plugin's data on this machine, and is only sent to NetEase's `music.163.com` and `interfacepc.music.163.com`, never to the audio CDN. Signing out forgets it. To end the session on NetEase's side, remove this device in the account's security settings.
 
@@ -51,11 +51,13 @@ Signed in:
 
 Not done: videos, bulk cloud deletion, creating or purchasing new podcasts, listening together, the feed.
 
-Plays are not reported back to NetEase, so its own listening charts don't move. The plugin keeps its own recent list of what was played on this machine.
+Opening Recently Played while signed in backfills the local song history to NetEase once per account; songs played afterward are reported as well. The page combines local and NetEase records. Older local entries have no original timestamps, so their dates cannot be restored. Podcast episodes stay local.
+
+Artist pages initially load 20 songs and 20 albums. Scroll to the bottom to load another 20 items in the current tab. This needs the updated [companion player patch](patches/mygo-v0.1.19.patch); a player without artist pagination shows only the first page.
 
 ## Sidebar layout
 
-Discovery, charts, new releases, playlists, podcasts and radio appear above a divider. Liked songs, saved albums, subscribed podcasts and the music cloud follow the divider, with the created and saved playlist groups and their lists beneath those navigation entries.
+Discovery, charts, new releases, playlists, podcasts and radio appear above a divider. Liked songs, recently played, saved albums, subscribed podcasts and the music cloud follow the divider, with the created and saved playlist groups and their lists beneath those navigation entries.
 
 The player needs to support plugin sidebar dividers and positioned playlist groups to show this order. The [host sidebar patch](patches/mygo-sidebar.patch) is one implementation; a player without these interfaces can still open ordinary plugin pages, but cannot show the divider or place playlist groups here.
 
@@ -90,7 +92,7 @@ NetEase's own LRC, together with the translation (`tlyric`) when there is one. T
 The website and the desktop app encrypt their requests in two different ways, and the plugin has to speak both:
 
 - `weapi`: comments, saving albums, following artists, creating and deleting playlists, reordering their tracks, recently played, the daily mix. AES-128-CBC twice, with the key wrapped in RSA.
-- `eapi`: liking and unliking, the ids of liked songs, playback addresses, saving a playlist, renaming a playlist, adding and removing its songs, all through `interfacepc.music.163.com`. AES-128-ECB once, with an MD5 inside the text and login credentials in both the encrypted header and Cookie.
+- `eapi`: PC QR sign-in, liking and unliking, the ids of liked songs, playback addresses, saving a playlist, renaming a playlist, adding and removing its songs, all through `interfacepc.music.163.com`. AES-128-ECB once, with an MD5 inside the text and login credentials in both the encrypted header and Cookie.
 
 The plugin's runtime has MD5 and AES-ECB (`host.crypto`) but no AES-CBC, so `index.js` carries a small AES-128-CBC of its own; the S-box is computed over the field rather than typed out. The RSA key is fixed, so its result is worked out once and kept as the constant `encSecKey`: the service only cares that it can recover the key, not that it's a new one every time.
 

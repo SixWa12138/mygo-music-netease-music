@@ -1,5 +1,190 @@
+diff --git a/internal/app/artist_paging_test.go b/internal/app/artist_paging_test.go
+new file mode 100644
+index 0000000..c2c0cbc
+--- /dev/null
++++ b/internal/app/artist_paging_test.go
+@@ -0,0 +1,151 @@
++package app
++
++import (
++	"errors"
++	"fmt"
++	"testing"
++	"time"
++
++	"github.com/egoist/mygo/ui"
++	"mygo-music/internal/music"
++)
++
++// An artist opens with 20 items in each tab and only asks for the active tab after scrolling down.
++func TestArtistScrollPaging(t *testing.T) {
++	for _, tab := range []int{artistSongs, artistAlbums} {
++		t.Run(fmt.Sprint(tab), func(t *testing.T) {
++			a := newTestApp()
++			ch := posts(a)
++			initial := &music.ArtistPage{Artist: music.Artist{ID: "12", Name: "Artist"}, TracksMore: true, AlbumsMore: true, TracksNextOffset: 20, AlbumsNextOffset: 20}
++			for i := range 20 {
++				initial.Tracks = append(initial.Tracks, song(fmt.Sprint(i+1), fmt.Sprintf("Song %d", i+1)))
++				initial.Albums = append(initial.Albums, music.Album{ID: fmt.Sprint(i + 1), Name: fmt.Sprintf("Album %d", i+1)})
++			}
++			fake(a).artist = func(id string) (*music.ArtistPage, error) { return initial, nil }
++			asked := make(chan int, 4)
++			fake(a).artistTracks = func(id string, offset int) (*music.Page, error) {
++				asked <- artistSongs
++				if id != "12" || offset != 20 {
++					return nil, fmt.Errorf("unexpected song page %s/%d", id, offset)
++				}
++				page := &music.Page{NextOffset: 40}
++				for i := range 20 {
++					page.Tracks = append(page.Tracks, song(fmt.Sprint(i+21), "Next song"))
++				}
++				return page, nil
++			}
++			fake(a).artistAlbums = func(id string, offset int) (*music.AlbumList, error) {
++				asked <- artistAlbums
++				if id != "12" || offset != 20 {
++					return nil, fmt.Errorf("unexpected album page %s/%d", id, offset)
++				}
++				page := &music.AlbumList{NextOffset: 40}
++				for i := range 20 {
++					page.Albums = append(page.Albums, music.Album{ID: fmt.Sprint(i + 21), Name: "Next album"})
++				}
++				return page, nil
++			}
++			a.open(route{page: pageArtist, src: "fake", id: "12"})
++			runPost(t, ch)
++			d := a.artists["12"]
++			d.tab = tab
++			tt := ui.NewTester(a.view, 1200, 800)
++			tt.Frame()
++			tt.Frame()
++			if len(asked) != 0 || len(d.page.Tracks) != 20 || len(d.page.Albums) != 20 {
++				t.Fatal("opening the artist fetched later pages")
++			}
++			tt.Scroll(800, 400, 0, 100000)
++			tt.Advance(time.Second)
++			tt.Frame()
++			tt.Frame()
++			pg := &d.songs
++			if tab == artistAlbums {
++				pg = &d.albums
++			}
++			if !pg.loading {
++				t.Fatal("scrolling to the end did not request a page")
++			}
++			for pg.loading {
++				runPost(t, ch)
++			}
++			if got := <-asked; got != tab {
++				t.Fatalf("scrolled tab %d requested tab %d", tab, got)
++			}
++			if len(asked) != 0 || d.songs.err != "" || d.albums.err != "" {
++				t.Fatalf("paging failed: songs %q, albums %q", d.songs.err, d.albums.err)
++			}
++			wantSongs, wantAlbums := 20, 20
++			if tab == artistSongs {
++				wantSongs = 40
++			} else {
++				wantAlbums = 40
++			}
++			if len(d.page.Tracks) != wantSongs || len(d.page.Albums) != wantAlbums {
++				t.Fatalf("loaded %d songs/%d albums", len(d.page.Tracks), len(d.page.Albums))
++			}
++		})
++	}
++}
++
++// Failed pages retain their offset for retry; overlaps do not repeat items or shift the next request.
++func TestArtistPagingRetry(t *testing.T) {
++	for _, tab := range []int{artistSongs, artistAlbums} {
++		t.Run(fmt.Sprint(tab), func(t *testing.T) {
++			a := newTestApp()
++			ch := posts(a)
++			d := &artistData{page: &music.ArtistPage{Artist: music.Artist{ID: "12"}, Tracks: []music.Track{song("1", "First")}, Albums: []music.Album{{ID: "1"}}}, songs: paged{loaded: true, more: true}, albums: paged{loaded: true, more: true}, songOffset: 20, albumOffset: 20}
++			calls := 0
++			fake(a).artistTracks = func(id string, offset int) (*music.Page, error) {
++				calls++
++				if calls == 1 {
++					return nil, errors.New("offline")
++				}
++				if calls == 2 && offset == 20 {
++					return &music.Page{Tracks: []music.Track{song("1", "Duplicate"), song("2", "Second")}, More: true, NextOffset: 40}, nil
++				}
++				if calls == 3 && offset == 40 {
++					return &music.Page{More: true, NextOffset: 40}, nil
++				}
++				return nil, fmt.Errorf("unexpected page %d/%d", calls, offset)
++			}
++			fake(a).artistAlbums = func(id string, offset int) (*music.AlbumList, error) {
++				calls++
++				if calls == 1 {
++					return nil, errors.New("offline")
++				}
++				if calls == 2 && offset == 20 {
++					return &music.AlbumList{Albums: []music.Album{{ID: "1"}, {ID: "2"}}, More: true, NextOffset: 40}, nil
++				}
++				if calls == 3 && offset == 40 {
++					return &music.AlbumList{More: true, NextOffset: 40}, nil
++				}
++				return nil, fmt.Errorf("unexpected page %d/%d", calls, offset)
++			}
++			pg := &d.songs
++			if tab == artistAlbums {
++				pg = &d.albums
++			}
++			a.moreArtist(a.library, "12", d, tab)
++			a.moreArtist(a.library, "12", d, tab)
++			runPost(t, ch)
++			if calls != 1 || pg.err == "" || d.songOffset != 20 || d.albumOffset != 20 {
++				t.Fatal("failed request changed paging state")
++			}
++			a.moreArtist(a.library, "12", d, tab)
++			runPost(t, ch)
++			if pg.err != "" || !pg.more {
++				t.Fatal("retry did not recover")
++			}
++			if tab == artistSongs && (len(d.page.Tracks) != 2 || d.songOffset != 40) || tab == artistAlbums && (len(d.page.Albums) != 2 || d.albumOffset != 40) {
++				t.Fatal("duplicate rows changed the next offset")
++			}
++			a.moreArtist(a.library, "12", d, tab)
++			runPost(t, ch)
++			a.moreArtist(a.library, "12", d, tab)
++			if calls != 3 || pg.more {
++				t.Fatal("empty response did not stop pagination")
++			}
++		})
++	}
++}
+diff --git a/internal/app/artist_test.go b/internal/app/artist_test.go
+index fec20f2..f7132ad 100644
+--- a/internal/app/artist_test.go
++++ b/internal/app/artist_test.go
+@@ -92,6 +92,23 @@ func TestArtistAlbums(t *testing.T) {
+ 	}
+ }
+ 
++// A linked artist account opens its own page from the artist header.
++func TestArtistPersonalPageButton(t *testing.T) {
++	a := newTestApp()
++	a.artists["12"] = &artistData{page: &music.ArtistPage{Artist: music.Artist{
++		ID: "12", Name: "Artist", Aliases: []string{"Original"}, Description: "Biography", Details: []string{"Details"}, UserID: "34",
++	}}}
++	a.open(route{page: pageArtist, id: "12"})
++	tt := ui.NewTester(a.view, 1200, 800)
++	tt.Frame()
++	if err := tt.Click(T("Personal page")); err != nil {
++		t.Fatal(err)
++	}
++	if a.route != (route{page: pageBrowse, src: "fake", id: "artist-profile:34"}) {
++		t.Fatalf("personal page opened %+v", a.route)
++	}
++}
++
+ // Follow follows an artist at once, and asks the source to; a second click
+ // waits for the first, and a follow the source refuses goes back.
+ func TestFollowArtist(t *testing.T) {
 diff --git a/internal/app/helpers_test.go b/internal/app/helpers_test.go
-index bf40150..a961b06 100644
+index bf40150..d9122d3 100644
 --- a/internal/app/helpers_test.go
 +++ b/internal/app/helpers_test.go
 @@ -1,6 +1,7 @@
@@ -10,11 +195,87 @@ index bf40150..a961b06 100644
  	"image"
  	"image/png"
  	"os"
-@@ -99,6 +100,14 @@ type fakeSource struct {
- 	lyrics      func(id string) (*music.Lyrics, error)
- 	stream      func(id, quality string) (*music.Stream, error)
- 	setSetting  func(key, value string) error
-+	uploadFile  func(context.Context, string, func(int64, int64)) error
+@@ -62,43 +63,53 @@ type fakeSource struct {
+ 	caps map[string]bool
+ 	vals map[string]string
+ 
+-	signIn      func() (*music.Account, error)
+-	signOut     func() error
+-	account     func() (*music.Account, error)
+-	search      func(query string, kind music.SearchKind, offset int) (*music.SearchResult, error)
+-	suggest     func(query string) ([]string, error)
+-	playlists   func() ([]music.Playlist, error)
+-	playlist    func(id string) (*music.Playlist, error)
+-	album       func(id string) (*music.AlbumPage, error)
+-	artist      func(id string) (*music.ArtistPage, error)
+-	liked       func(offset int) (*music.Page, error)
+-	recent      func() ([]music.Track, error)
+-	home        func() (*music.Browse, error)
+-	browse      func(page string) (*music.Browse, error)
+-	isLiked     func(ids []string) (map[string]bool, error)
+-	like        func(id string, on bool) error
+-	likeEpisode func(id string, on bool) error
+-	create      func(name string) (*music.Playlist, error)
+-	rename      func(id, name string) error
+-	remove      func(id string) error
+-	addTo       func(id string, tracks []string) error
+-	removeFrom  func(id string, tracks []string) error
+-	move        func(id string, from, to int) error
+-	save        func(id string, on bool) error
+-	follow      func(id string, on bool) error
+-	saveAlbum   func(id string, on bool) error
+-	savedAlbums func(offset int) (*music.AlbumList, error)
+-	shows       func() ([]music.Show, error)
+-	show        func(id string, offset int) (*music.ShowPage, error)
+-	subscribe   func(id string, on bool) error
+-	stations    func() ([]music.Station, error)
+-	stationNext func(id string) ([]music.Track, error)
+-	comments    func(track string, offset int) (*music.CommentPage, error)
+-	likeComment func(track, comment string, on bool) error
+-	postComment func(track, text string) (*music.Comment, error)
+-	lyrics      func(id string) (*music.Lyrics, error)
+-	stream      func(id, quality string) (*music.Stream, error)
+-	setSetting  func(key, value string) error
++	signIn       func() (*music.Account, error)
++	signOut      func() error
++	account      func() (*music.Account, error)
++	search       func(query string, kind music.SearchKind, offset int) (*music.SearchResult, error)
++	suggest      func(query string) ([]string, error)
++	playlists    func() ([]music.Playlist, error)
++	playlist     func(id string) (*music.Playlist, error)
++	album        func(id string) (*music.AlbumPage, error)
++	artist       func(id string) (*music.ArtistPage, error)
++	artistTracks func(id string, offset int) (*music.Page, error)
++	artistAlbums func(id string, offset int) (*music.AlbumList, error)
++	liked        func(offset int) (*music.Page, error)
++	recent       func() ([]music.Track, error)
++	home         func() (*music.Browse, error)
++	browse       func(page string) (*music.Browse, error)
++	isLiked      func(ids []string) (map[string]bool, error)
++	like         func(id string, on bool) error
++	likeEpisode  func(id string, on bool) error
++	create       func(name string) (*music.Playlist, error)
++	rename       func(id, name string) error
++	remove       func(id string) error
++	addTo        func(id string, tracks []string) error
++	removeFrom   func(id string, tracks []string) error
++	move         func(id string, from, to int) error
++	save         func(id string, on bool) error
++	follow       func(id string, on bool) error
++	saveAlbum    func(id string, on bool) error
++	savedAlbums  func(offset int) (*music.AlbumList, error)
++	shows        func() ([]music.Show, error)
++	show         func(id string, offset int) (*music.ShowPage, error)
++	subscribe    func(id string, on bool) error
++	stations     func() ([]music.Station, error)
++	stationNext  func(id string) ([]music.Track, error)
++	comments     func(track string, offset int) (*music.CommentPage, error)
++	likeComment  func(track, comment string, on bool) error
++	postComment  func(track, text string) (*music.Comment, error)
++	lyrics       func(id string) (*music.Lyrics, error)
++	stream       func(id, quality string) (*music.Stream, error)
++	setSetting   func(key, value string) error
++	uploadFile   func(context.Context, string, func(int64, int64)) error
 +}
 +
 +func (s *fakeSource) Upload(ctx context.Context, path string, progress func(int64, int64)) error {
@@ -25,6 +286,27 @@ index bf40150..a961b06 100644
  }
  
  func newFakeSource(id string) *fakeSource {
+@@ -182,6 +193,20 @@ func (s *fakeSource) Liked(offset int) (*music.Page, error) {
+ 	}
+ 	return s.liked(offset)
+ }
++
++func (s *fakeSource) ArtistTracks(id string, offset int) (*music.Page, error) {
++	if s.artistTracks == nil {
++		return nil, music.ErrUnsupported
++	}
++	return s.artistTracks(id, offset)
++}
++
++func (s *fakeSource) ArtistAlbums(id string, offset int) (*music.AlbumList, error) {
++	if s.artistAlbums == nil {
++		return nil, music.ErrUnsupported
++	}
++	return s.artistAlbums(id, offset)
++}
+ func (s *fakeSource) Recent() ([]music.Track, error) {
+ 	if s.recent == nil {
+ 		return nil, nil
 diff --git a/internal/app/icons.go b/internal/app/icons.go
 index 381f915..5e34c02 100644
 --- a/internal/app/icons.go
@@ -215,18 +497,20 @@ index 17540fa..f3a2863 100644
 +	}
 +}
 diff --git a/internal/app/sources.go b/internal/app/sources.go
-index d730be4..7e1ce39 100644
+index d730be4..3e4d571 100644
 --- a/internal/app/sources.go
 +++ b/internal/app/sources.go
-@@ -27,6 +27,7 @@ var capabilities = []string{
+@@ -26,7 +26,9 @@ var capabilities = []string{
+ 	"signIn", "signOut", "account",
  	"search", "suggest",
  	"playlists", "playlist", "album", "artist", "liked", "recent",
++	"artistTracks", "artistAlbums",
  	"home", "browse",
 +	"upload",
  	"isLiked", "like", "likeEpisode",
  	"createPlaylist", "renamePlaylist", "deletePlaylist", "addToPlaylist", "removeFromPlaylist", "movePlaylistTrack", "savePlaylist",
  	"followArtist", "saveAlbum", "savedAlbums",
-@@ -89,6 +90,7 @@ type library struct {
+@@ -89,6 +91,7 @@ type library struct {
  	albums    map[string]*albumData
  	shows     map[string]*showData
  	browses   map[string]*browseData
@@ -234,6 +518,160 @@ index d730be4..7e1ce39 100644
  	searches  map[route]*searchData
  	searched  route // the search last shown, which the sidebar goes back to
  
+diff --git a/internal/app/ui_artist.go b/internal/app/ui_artist.go
+index 3391642..bc229c6 100644
+--- a/internal/app/ui_artist.go
++++ b/internal/app/ui_artist.go
+@@ -72,11 +72,15 @@ func (a *app) openArtist(src, id string) { a.openPage(route{page: pageArtist, sr
+ // artistData is what the app has of an artist: who they are, with their songs
+ // and albums.
+ type artistData struct {
+-	page      *music.ArtistPage
+-	loading   bool
+-	err       string
+-	following bool // a follow or unfollow is on its way
+-	tab       int  // what their page lists: artistSongs or artistAlbums
++	page        *music.ArtistPage
++	loading     bool
++	err         string
++	following   bool // a follow or unfollow is on its way
++	tab         int  // what their page lists: artistSongs or artistAlbums
++	songs       paged
++	albums      paged
++	songOffset  int
++	albumOffset int
+ }
+ 
+ // What an artist's page lists.
+@@ -104,6 +108,72 @@ func (a *app) loadArtist(lib *library, id string) {
+ 				return
+ 			}
+ 			d.page = ar
++			d.songs = paged{loaded: true, more: ar.TracksMore && lib.can("artistTracks") && len(ar.Tracks) > 0}
++			d.albums = paged{loaded: true, more: ar.AlbumsMore && lib.can("artistAlbums") && len(ar.Albums) > 0}
++			d.songOffset = max(ar.TracksNextOffset, len(ar.Tracks))
++			d.albumOffset = max(ar.AlbumsNextOffset, len(ar.Albums))
++		})
++	}()
++}
++
++// Load only the active tab, keeping its offset and existing rows when a request fails.
++func (a *app) moreArtist(lib *library, id string, d *artistData, tab int) {
++	pager, ok := lib.src.(music.ArtistPager)
++	if !ok || d.page == nil {
++		return
++	}
++	pg, offset := &d.songs, d.songOffset
++	if tab == artistAlbums {
++		pg, offset = &d.albums, d.albumOffset
++	}
++	if pg.loading || !pg.more {
++		return
++	}
++	pg.loading, pg.err = true, ""
++	go func() {
++		var tracks *music.Page
++		var albums *music.AlbumList
++		var err error
++		if tab == artistAlbums {
++			albums, err = answered(pager.ArtistAlbums(id, offset))
++		} else {
++			tracks, err = answered(pager.ArtistTracks(id, offset))
++		}
++		a.post(func() {
++			pg.loading = false
++			if err != nil {
++				pg.err = a.problem(lib, err, T("Couldn't load this artist"))
++				return
++			}
++			if tab == artistAlbums {
++				known := make(map[string]bool, len(d.page.Albums))
++				for _, item := range d.page.Albums {
++					known[item.ID] = true
++				}
++				before := len(d.page.Albums)
++				for _, item := range albums.Albums {
++					if !known[item.ID] {
++						d.page.Albums = append(d.page.Albums, item)
++						known[item.ID] = true
++					}
++				}
++				pg.more = albums.More && len(d.page.Albums) > before
++				d.albumOffset = max(albums.NextOffset, offset+len(albums.Albums))
++			} else {
++				known := make(map[string]bool, len(d.page.Tracks))
++				for _, item := range d.page.Tracks {
++					known[item.ID] = true
++				}
++				before := len(d.page.Tracks)
++				for _, item := range tracks.Tracks {
++					if !known[item.ID] {
++						d.page.Tracks = append(d.page.Tracks, item)
++						known[item.ID] = true
++					}
++				}
++				pg.more = tracks.More && len(d.page.Tracks) > before
++				d.songOffset = max(tracks.NextOffset, offset+len(tracks.Tracks))
++			}
+ 		})
+ 	}()
+ }
+@@ -172,10 +242,13 @@ func (a *app) artistPage(c *ui.Context) {
+ 			if len(d.page.Albums) == 0 {
+ 				a.empty(c, T("No albums"))
+ 			}
++			a.pageFoot(c, &d.albums, func() { a.moreArtist(lib, id, d, artistAlbums) }, true)
+ 		})
+ 		return
+ 	}
+-	a.trackRows(c, d.page.Tracks, true, header)
++	a.trackRows(c, d.page.Tracks, true, header, func(c *ui.Context) {
++		a.pageFoot(c, &d.songs, func() { a.moreArtist(lib, id, d, artistSongs) }, true)
++	})
+ }
+ 
+ // scrollPage scrolls a page of cards and rows, inset as one of tracks is:
+@@ -209,6 +282,17 @@ func (a *app) artistHeader(c *ui.Context, d *artistData) {
+ 		ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(8).Children(func() {
+ 			ui.Text(c, T("Artist")).FontSize(12).FontWeight(600).TextColor(p.accent)
+ 			ui.Text(c, ar.Name).FontSize(30).FontWeight(800).LetterSpacing(-0.6).MaxLines(2).LineHeight(1.2)
++			var names []string
++			if ar.Trans != "" {
++				names = append(names, ar.Trans)
++			}
++			names = append(names, ar.Aliases...)
++			if len(names) > 0 {
++				ui.Text(c, T("Also known as")+": "+strings.Join(names, " · ")).FontSize(12.5).TextColor(p.muted).MaxLines(2)
++			}
++			if ar.Description != "" {
++				ui.Text(c, ar.Description).FontSize(13).TextColor(p.muted).MaxLines(3).LineHeight(1.45)
++			}
+ 			var meta []string
+ 			if len(songs) > 0 {
+ 				meta = append(meta, i18n.Songs(len(songs)))
+@@ -232,9 +316,22 @@ func (a *app) artistHeader(c *ui.Context, d *artistData) {
+ 						a.toggleFollow(lib, d)
+ 					}
+ 				}
++				if ar.UserID != "" {
++					if pillButton(c.Key("profile"), iconUser, T("Personal page"), p.hover.Over(p.bg), p.text).Clicked() {
++						a.openPage(route{page: pageBrowse, src: lib.id, id: "artist-profile:" + ar.UserID})
++					}
++				}
+ 			})
+ 		})
+ 	})
++	for i, detail := range ar.Details {
++		if detail != "" {
++			if i == 0 {
++				ui.Text(c, T("Details")).FontSize(17).FontWeight(700).Margin(20, 0, 8, 0)
++			}
++			ui.Text(c.Key("detail").Key(i), detail).FontSize(13).TextColor(p.muted).LineHeight(1.45).Padding(0, 0, 12, 0)
++		}
++	}
+ 	title := T("Songs")
+ 	if d.tab == artistAlbums || len(songs) == 0 {
+ 		title = T("Albums")
 diff --git a/internal/app/ui_browse.go b/internal/app/ui_browse.go
 index ea734a9..cde7e8a 100644
 --- a/internal/app/ui_browse.go
@@ -281,6 +719,33 @@ index ea734a9..cde7e8a 100644
  	if page.ImageURL == "" {
  		if len(lines) == 0 {
  			if page.Title != "" {
+diff --git a/internal/app/ui_kit.go b/internal/app/ui_kit.go
+index cf644a4..827b42f 100644
+--- a/internal/app/ui_kit.go
++++ b/internal/app/ui_kit.go
+@@ -336,7 +336,8 @@ type paged struct {
+ // pageFoot ends a list loaded a page at a time, asking next for the next
+ // page once it is within a screen of coming into view: where the last
+ // failed, it says so, with a button to try again.
+-func (a *app) pageFoot(c *ui.Context, pg *paged, next func()) {
++// Artist pages request the next batch only once the footer is visible.
++func (a *app) pageFoot(c *ui.Context, pg *paged, next func(), visibleOnly ...bool) {
+ 	foot := ui.Row(c.Key("foot")).Height(56).Gap(12).Center()
+ 	foot.Children(func() {
+ 		switch {
+@@ -350,7 +351,11 @@ func (a *app) pageFoot(c *ui.Context, pg *paged, next func()) {
+ 		}
+ 	})
+ 	_, h := c.Size()
+-	if b := foot.Bounds(); pg.more && !pg.loading && pg.err == "" && b.W > 0 && b.Y < 2*h {
++	limit := 2 * h
++	if len(visibleOnly) > 0 && visibleOnly[0] {
++		limit = h
++	}
++	if b := foot.Bounds(); pg.more && !pg.loading && pg.err == "" && b.W > 0 && b.Y < limit {
+ 		next()
+ 	}
+ }
 diff --git a/internal/app/ui_main.go b/internal/app/ui_main.go
 index 33aea70..79b94a6 100644
 --- a/internal/app/ui_main.go
@@ -686,7 +1151,7 @@ index 0000000..873e782
 +	return paths
 +}
 diff --git a/internal/i18n/zh_cn.go b/internal/i18n/zh_cn.go
-index cacfb98..98a7eda 100644
+index cacfb98..61dc66f 100644
 --- a/internal/i18n/zh_cn.go
 +++ b/internal/i18n/zh_cn.go
 @@ -2,27 +2,60 @@ package i18n
@@ -771,6 +1236,16 @@ index cacfb98..98a7eda 100644
  	"A small player at the notch on top of the screen, which opens as the pointer rests on it": "在屏幕顶部的刘海处显示迷你播放器，鼠标悬停即可展开",
  	"About":                                  "简介",
  	"About %s":                               "关于%s",
+@@ -44,6 +77,9 @@ var zhCN = map[string]string{
+ 	"App Icon":                           "应用图标",
+ 	"Appearance":                         "外观",
+ 	"Artist":                             "歌手",
++	"Also known as":                      "原名 / 别名",
++	"Details":                            "详情",
++	"Personal page":                      "个人主页",
+ 	"Artists":                            "歌手",
+ 	"Back":                               "返回",
+ 	"Bring All to Front":                 "前置全部窗口",
 diff --git a/internal/music/convert.go b/internal/music/convert.go
 new file mode 100644
 index 0000000..69bd1cf
@@ -849,7 +1324,7 @@ index 0000000..1e96c00
 +
 +func hideAudioCommand(cmd *exec.Cmd) { cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true} }
 diff --git a/internal/music/music.go b/internal/music/music.go
-index 0eaaaa5..12aa120 100644
+index 0eaaaa5..0f88401 100644
 --- a/internal/music/music.go
 +++ b/internal/music/music.go
 @@ -4,6 +4,7 @@
@@ -860,7 +1335,69 @@ index 0eaaaa5..12aa120 100644
  	"errors"
  	"strings"
  	"time"
-@@ -192,8 +193,22 @@ type Browse struct {
+@@ -12,9 +13,14 @@ import (
+ // IDs are the source's own and mean nothing outside it.
+ 
+ type Artist struct {
+-	ID       string `json:"id"`
+-	Name     string `json:"name"`
+-	ImageURL string `json:"imageUrl,omitempty"`
++	ID          string   `json:"id"`
++	Name        string   `json:"name"`
++	ImageURL    string   `json:"imageUrl,omitempty"`
++	Aliases     []string `json:"aliases,omitempty"`
++	Trans       string   `json:"trans,omitempty"`
++	Description string   `json:"description,omitempty"`
++	Details     []string `json:"details,omitempty"`
++	UserID      string   `json:"userId,omitempty"`
+ 	// Following says the listener follows them, for a source with followArtist.
+ 	Following bool `json:"following,omitempty"`
+ }
+@@ -76,9 +82,19 @@ type Playlist struct {
+ 
+ // ArtistPage is what an artist's page shows.
+ type ArtistPage struct {
+-	Artist Artist  `json:"artist"`
+-	Tracks []Track `json:"tracks,omitempty"`
+-	Albums []Album `json:"albums,omitempty"`
++	Artist           Artist  `json:"artist"`
++	Tracks           []Track `json:"tracks,omitempty"`
++	Albums           []Album `json:"albums,omitempty"`
++	TracksMore       bool    `json:"tracksMore,omitempty"`
++	AlbumsMore       bool    `json:"albumsMore,omitempty"`
++	TracksNextOffset int     `json:"tracksNextOffset,omitempty"`
++	AlbumsNextOffset int     `json:"albumsNextOffset,omitempty"`
++}
++
++// ArtistPager supplies later pages without changing sources that return a complete artist page.
++type ArtistPager interface {
++	ArtistTracks(id string, offset int) (*Page, error)
++	ArtistAlbums(id string, offset int) (*AlbumList, error)
+ }
+ 
+ // AlbumPage is what an album's page shows.
+@@ -126,14 +142,16 @@ func (r *SearchResult) Len() int {
+ 
+ // Page is a page of tracks.
+ type Page struct {
+-	Tracks []Track `json:"tracks,omitempty"`
+-	More   bool    `json:"more,omitempty"`
++	Tracks     []Track `json:"tracks,omitempty"`
++	More       bool    `json:"more,omitempty"`
++	NextOffset int     `json:"nextOffset,omitempty"`
+ }
+ 
+ // AlbumList is a page of albums.
+ type AlbumList struct {
+-	Albums []Album `json:"albums,omitempty"`
+-	More   bool    `json:"more,omitempty"`
++	Albums     []Album `json:"albums,omitempty"`
++	More       bool    `json:"more,omitempty"`
++	NextOffset int     `json:"nextOffset,omitempty"`
+ }
+ 
+ // Show is a podcast. Its episodes are tracks.
+@@ -192,8 +210,22 @@ type Browse struct {
  	// avatar, which heads it round, as an artist's photo heads theirs.
  	ImageURL string `json:"imageUrl,omitempty"`
  	// Description goes under the title, a line to each line of it.
@@ -885,7 +1422,7 @@ index 0eaaaa5..12aa120 100644
  }
  
  // Section is a heading over what it lists. A section may hold several kinds,
-@@ -234,11 +249,11 @@ type Link struct {
+@@ -234,11 +266,11 @@ type Link struct {
  type NavItem struct {
  	Title string `json:"title"`
  	Page  string `json:"page,omitempty"`
@@ -1438,6 +1975,48 @@ index d113271..f59b9fb 100644
  	}
  	return s, nil
  }
+diff --git a/internal/plugin/artist_paging_test.go b/internal/plugin/artist_paging_test.go
+new file mode 100644
+index 0000000..a50ab1e
+--- /dev/null
++++ b/internal/plugin/artist_paging_test.go
+@@ -0,0 +1,36 @@
++package plugin
++
++import (
++	"errors"
++	"testing"
++
++	"mygo-music/internal/music"
++)
++
++// Later artist pages receive the requested offset and retain the plugin's playback source.
++func TestArtistPagingExports(t *testing.T) {
++	p := load(t, plain, `
++export function artistTracks({id, offset}) {
++  if (id !== "12" || offset !== 20) throw new Error("wrong song page");
++  return {tracks:[{id:"21",source:"wrong"}],more:true,nextOffset:40};
++}
++export function artistAlbums({id, offset}) {
++  if (id !== "12" || offset !== 40) throw new Error("wrong album page");
++  return {albums:[{id:"41"}],more:false,nextOffset:60};
++}`)
++	tracks, err := p.ArtistTracks("12", 20)
++	if err != nil || len(tracks.Tracks) != 1 || tracks.Tracks[0].Source != "x" || !tracks.More || tracks.NextOffset != 40 {
++		t.Fatalf("song page: %+v, %v", tracks, err)
++	}
++	albums, err := p.ArtistAlbums("12", 40)
++	if err != nil || len(albums.Albums) != 1 || albums.More || albums.NextOffset != 60 {
++		t.Fatalf("album page: %+v, %v", albums, err)
++	}
++	old := load(t, plain, `export function artist(){return {artist:{id:"12"},tracks:[{id:"1"}]};}`)
++	if old.Can("artistTracks") || old.Can("artistAlbums") {
++		t.Fatal("old plugin claims pagination support")
++	}
++	if _, err := old.ArtistTracks("12", 20); !errors.Is(err, music.ErrUnsupported) {
++		t.Fatalf("old plugin: %v", err)
++	}
++}
 diff --git a/internal/plugin/host.go b/internal/plugin/host.go
 index be7c8ab..38da6cf 100644
 --- a/internal/plugin/host.go
@@ -1510,6 +2089,34 @@ index 8dc5a01..47926f4 100644
  	case a := <-ch:
  		if a.err != nil {
  			return a.err
+diff --git a/internal/plugin/source.go b/internal/plugin/source.go
+index fd9cc2c..386dd28 100644
+--- a/internal/plugin/source.go
++++ b/internal/plugin/source.go
+@@ -133,6 +133,23 @@ func (p *Plugin) Liked(offset int) (*music.Page, error) {
+ 	return &page, nil
+ }
+ 
++func (p *Plugin) ArtistTracks(id string, offset int) (*music.Page, error) {
++	var page music.Page
++	if err := p.call("artistTracks", map[string]any{"id": id, "offset": offset}, &page); err != nil {
++		return nil, err
++	}
++	p.stamp(page.Tracks)
++	return &page, nil
++}
++
++func (p *Plugin) ArtistAlbums(id string, offset int) (*music.AlbumList, error) {
++	var page music.AlbumList
++	if err := p.call("artistAlbums", map[string]any{"id": id, "offset": offset}, &page); err != nil {
++		return nil, err
++	}
++	return &page, nil
++}
++
+ func (p *Plugin) Recent() ([]music.Track, error) {
+ 	var tracks []music.Track
+ 	if err := p.call("recent", nil, &tracks); err != nil {
 diff --git a/internal/plugin/upload.go b/internal/plugin/upload.go
 new file mode 100644
 index 0000000..89d4b83

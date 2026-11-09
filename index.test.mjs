@@ -22,6 +22,7 @@ async function setup(handler, signedIn = true) {
     const address = new URL(url);
     assert.ok(manifest.permissions.network.some(pattern => pattern === address.hostname || (pattern.startsWith("*.") && address.hostname.endsWith(pattern.slice(1)))), `Missing network permission for ${address.hostname}`);
     const body = await handler(address, init);
+    if (body instanceof Response) return body;
     return { ok: true, status: 200, json: async () => body };
   };
   return import(`./index.js?test=${++sequence}`);
@@ -39,10 +40,91 @@ function request(url, init) {
   assert.equal(digest, createHash("md5").update(`nobody${path}use${json}md5forencrypt`).digest("hex"));
   const body = JSON.parse(json);
   assert.equal(body.e_r, false);
+  assert.equal(body.header.os, "pc");
+  assert.equal(body.header.appver, "3.1.17.204416");
+  assert.match(init.headers["user-agent"], /^NeteaseMusic 3\.1\.17\/204416 \(Windows;/);
   return body;
 }
 
 const song = id => ({ id, name: `Song ${id}`, ar: [], al: {}, dt: 180000 });
+
+test("QR sign-in starts through the PC client endpoint", async () => {
+  const plugin = await setup((url, init) => {
+    assert.equal(url.pathname, "/eapi/login/qrcode/unikey");
+    const body = request(url, init);
+    assert.equal(body.type, 3);
+    return { code: 200, unikey: "test-qr" };
+  }, false);
+  const stop = new Error("stop after QR prompt");
+  host.signInPrompt = prompt => { if (prompt.qr) throw stop; };
+  await assert.rejects(plugin.signIn(), stop);
+});
+
+// Both QR requests must use PC type 3 and carry the new session through confirmation.
+test("PC QR sign-in confirms the account and saves its session", async () => {
+  let device;
+  let polls = 0;
+  const prompts = [];
+  const plugin = await setup((url, init) => {
+    if (url.pathname === "/api/nuser/account/get") {
+      assert.match(init.headers.cookie, /MUSIC_U=new-session/);
+      assert.match(init.headers.cookie, /__csrf=new-csrf/);
+      return { code: 200, profile: { userId: 42, nickname: "PC account" } };
+    }
+    const body = request(url, init);
+    assert.equal(body.type, 3);
+    assert.equal(body.header.MUSIC_U, undefined);
+    assert.ok(!init.headers.cookie.includes("test-session"));
+    if (url.pathname === "/eapi/login/qrcode/unikey") {
+      device = body.header.deviceId;
+      assert.equal(body.header.__csrf, "");
+      return new Response(JSON.stringify({ code: 200, unikey: "pc/qr+key" }), {
+        headers: { "set-cookie": "NMTID=qr-device; Path=/; HttpOnly" },
+      });
+    }
+    assert.equal(url.pathname, "/eapi/login/qrcode/client/login");
+    assert.equal(body.key, "pc/qr+key");
+    assert.equal(body.header.deviceId, device);
+    assert.equal(body.header.NMTID, "qr-device");
+    const code = [801, 802, 803][polls++];
+    assert.ok(code, "unexpected extra QR poll");
+    return new Response(JSON.stringify({ code }), {
+      headers: code === 803 ? [
+        ["set-cookie", "MUSIC_U=new-session; Path=/; HttpOnly"],
+        ["set-cookie", "__csrf=new-csrf; Path=/"],
+      ] : [],
+    });
+  });
+  host.signInPrompt = prompt => prompts.push(prompt);
+  const who = await plugin.signIn();
+  assert.equal(who.id, "42");
+  assert.equal(who.name, "PC account");
+  assert.equal(polls, 3);
+  assert.equal(prompts[1].qr, "https://music.163.com/login?codekey=pc%2Fqr%2Bkey");
+  assert.equal(prompts[2].qr, prompts[1].qr);
+  assert.match(host.storage.get("cookie"), /MUSIC_U=new-session/);
+  assert.ok(!host.storage.get("cookie").includes("test-session"));
+  assert.deepEqual(await plugin.account(), who);
+  plugin.signOut();
+  assert.equal(host.storage.get("cookie"), undefined);
+  assert.equal(await plugin.account(), null);
+});
+
+// An expired QR or a confirmation without MUSIC_U must never replace an existing session.
+test("PC QR sign-in rejects expiry and missing session cookies", async () => {
+  for (const code of [800, 803]) {
+    const plugin = await setup((url, init) => {
+      assert.equal(request(url, init).type, 3);
+      const body = url.pathname === "/eapi/login/qrcode/unikey"
+        ? { code: 200, unikey: "test-qr" } : { code };
+      return new Response(JSON.stringify(body));
+    });
+    host.signInPrompt = () => {};
+    const previous = host.storage.get("cookie");
+    await assert.rejects(plugin.signIn(), { code: "signIn" });
+    assert.equal(host.storage.get("cookie"), previous);
+  }
+});
 
 test("song search keeps album artwork from the fields returned by search", async () => {
   const plugin = await setup(url => {
@@ -59,6 +141,140 @@ test("song search keeps album artwork from the fields returned by search", async
   });
   const result = await plugin.search({ query: "song", kind: "tracks", offset: 0 });
   assert.equal(result.tracks[0].album.imageUrl, "https://p1.music.126.net/primary.jpg");
+});
+
+test("full song, artist and album search pages continue when the service omits counts", async () => {
+  const plugin = await setup(url => {
+    const type = Number(url.searchParams.get("type"));
+    assert.equal(Number(url.searchParams.get("offset")), 30);
+    const result = {
+      1: { songs: Array.from({ length: 30 }, (_, id) => song(id + 1)) },
+      10: { albums: Array.from({ length: 30 }, (_, id) => ({ id: id + 1, name: `Album ${id}` })) },
+      100: { artists: Array.from({ length: 30 }, (_, id) => ({ id: id + 1, name: `Artist ${id}` })) },
+    }[type];
+    return { code: 200, result };
+  });
+  for (const kind of ["tracks", "artists", "albums"]) {
+    assert.equal((await plugin.search({ query: "test", kind, offset: 30 })).more, true);
+  }
+});
+
+// The old /artist/desc request fails; use /artist/introduction with the encrypted artist ID.
+test("artist pages expose aliases, full introduction and a linked account profile", async () => {
+  const plugin = await setup((url, init) => {
+    if (url.pathname === "/api/v1/artist/12") {
+      return { code: 200, artist: { id: 12, name: "Artist", alias: ["Alias"], trans: "Original", accountId: 34 } };
+    }
+    if (url.pathname === "/api/artist/albums/12") return { code: 200, hotAlbums: [] };
+    if (url.pathname === "/api/v1/artist/songs") return { code: 200, songs: [], more: false };
+    if (url.pathname === "/api/artist/desc") return { code: 400, msg: "参数错误" };
+    if (url.pathname === "/weapi/artist/introduction") {
+      assert.equal(init.method, "POST");
+      const form = new URLSearchParams(init.body);
+      const decrypt = (key, text) => {
+        const cipher = createDecipheriv("aes-128-cbc", key, "0102030405060708");
+        return Buffer.concat([cipher.update(text, "base64"), cipher.final()]).toString("utf8");
+      };
+      const body = JSON.parse(decrypt("0CoJUm6Qyw8W8jud", decrypt("mygomusicnetease", form.get("params"))));
+      assert.equal(body.id, 12);
+      assert.equal(body.csrf_token, "test-csrf");
+      assert.ok(form.get("encSecKey"));
+      return { code: 200, briefDesc: "Short bio", introduction: [{ name: "Career", txt: "Long bio" }] };
+    }
+    if (url.pathname === "/api/user/detail") return { code: 200, profile: { nickname: "Artist account", avatarUrl: "http://p1.music.126.net/avatar.jpg", signature: "Profile bio" } };
+    if (url.pathname === "/api/user/playlist") {
+      const offset = Number(url.searchParams.get("offset"));
+      return offset === 0
+        ? { code: 200, playlist: Array.from({ length: 30 }, (_, id) => ({ id: id + 9, name: `Public playlist ${id}` })), more: true }
+        : { code: 200, playlist: [{ id: 99, name: "Last playlist" }], more: false };
+    }
+    assert.fail(url.pathname);
+  });
+  const page = await plugin.artist({ id: "12" });
+  assert.deepEqual(page.artist.aliases, ["Alias"]);
+  assert.equal(page.artist.trans, "Original");
+  assert.equal(page.artist.description, "Short bio");
+  assert.deepEqual(page.artist.details, ["Career\nLong bio"]);
+  assert.equal(page.artist.userId, "34");
+  const profile = await plugin.browse({ page: "artist-profile:34" });
+  assert.equal(profile.title, "Artist account");
+  assert.equal(profile.imageUrl, "https://p1.music.126.net/avatar.jpg");
+  assert.equal(profile.description, "Profile bio");
+  assert.equal(profile.sections[0].playlists[0].id, "9");
+  assert.equal(profile.sections[1].links[0].page, "artist-profile:34:30");
+  const next = await plugin.browse({ page: profile.sections[1].links[0].page });
+  assert.equal(next.sections[0].playlists[0].id, "99");
+  assert.equal(next.sections[1].links[0].page, "artist-profile:34:0");
+});
+
+// Opening an artist must request only the first 20 songs and albums; later actions page independently.
+test("artist pages load 20 items initially and expose independent next pages", async () => {
+  const offsets = { songs: [], albums: [] };
+  const plugin = await setup(url => {
+    if (url.pathname === "/api/v1/artist/12") return { code: 200, artist: { id: 12 }, hotSongs: Array.from({ length: 50 }, (_, i) => song(i + 1)) };
+    if (url.pathname === "/weapi/artist/introduction") return { code: 200 };
+    const offset = Number(url.searchParams.get("offset"));
+    assert.equal(url.searchParams.get("limit"), "20");
+    if (url.pathname === "/api/v1/artist/songs") {
+      assert.equal(url.searchParams.get("id"), "12");
+      assert.equal(url.searchParams.get("private_cloud"), "true");
+      assert.equal(url.searchParams.get("work_type"), "1");
+      assert.equal(url.searchParams.get("order"), "hot");
+      offsets.songs.push(offset);
+      if (offset === 0 || offset === 20) return { code: 200, songs: Array.from({ length: 20 }, (_, i) => song(offset + i + 1)), more: true };
+      assert.equal(offset, 40);
+      return { code: 200, songs: [song(41), song(42), song(43)], more: false };
+    }
+    assert.equal(url.pathname, "/api/artist/albums/12");
+    offsets.albums.push(offset);
+    if (offset === 0) return { code: 200, hotAlbums: Array.from({ length: 20 }, (_, i) => ({ id: i + 1 })), more: true };
+    assert.equal(offset, 20);
+    return { code: 200, hotAlbums: [{ id: 21 }, { id: 22 }], more: false };
+  }, false);
+  const page = await plugin.artist({ id: "12" });
+  assert.equal(page.tracks.length, 20);
+  assert.equal(page.albums.length, 20);
+  assert.equal(page.tracksMore, true);
+  assert.equal(page.albumsMore, true);
+  assert.equal(page.tracksNextOffset, 20);
+  assert.equal(page.albumsNextOffset, 20);
+  assert.deepEqual(offsets, { songs: [0], albums: [0] });
+  const songs = await plugin.artistTracks({ id: "12", offset: page.tracksNextOffset });
+  assert.deepEqual(songs.tracks.map(track => track.id), Array.from({ length: 20 }, (_, i) => String(i + 21)));
+  assert.equal(songs.more, true);
+  assert.equal(songs.nextOffset, 40);
+  assert.deepEqual(offsets.albums, [0]);
+  const albums = await plugin.artistAlbums({ id: "12", offset: page.albumsNextOffset });
+  assert.deepEqual(albums.albums.map(album => album.id), ["21", "22"]);
+  assert.equal(albums.more, false);
+  assert.equal(albums.nextOffset, 22);
+  const last = await plugin.artistTracks({ id: "12", offset: songs.nextOffset });
+  assert.deepEqual(last.tracks.map(track => track.id), ["41", "42", "43"]);
+  assert.equal(last.more, false);
+  assert.equal(last.nextOffset, 43);
+  assert.deepEqual(offsets, { songs: [0, 20, 40], albums: [0, 20] });
+});
+
+// Pagination rejects invalid offsets, stops on empty responses and preserves the raw API offset.
+test("artist pages validate offsets and stop empty pages", async () => {
+  let reply = { code: 200, songs: [], hotAlbums: [], more: true };
+  let calls = 0;
+  const plugin = await setup(() => { calls++; return reply; }, false);
+  for (const action of [plugin.artistTracks, plugin.artistAlbums]) {
+    for (const offset of [-1, 0.5, NaN, 1e20]) {
+      await assert.rejects(action({ id: "12", offset }), { code: "unavailable" });
+    }
+    const page = await action({ id: "12", offset: 20 });
+    assert.equal(page.more, false);
+    assert.equal(page.nextOffset, 20);
+  }
+  assert.equal(calls, 2);
+  reply = { code: 200, songs: [song(21), null, song(22)], more: true };
+  const page = await plugin.artistTracks({ id: "12", offset: 20 });
+  assert.equal(page.tracks.length, 2);
+  assert.equal(page.nextOffset, 23);
+  reply = { code: 400, msg: "分页失败" };
+  await assert.rejects(plugin.artistTracks({ id: "12", offset: 23 }), /分页失败/);
 });
 
 // Each personal podcast tab must call its own client endpoint and keep its content playable.
@@ -359,6 +575,14 @@ test("podcast discovery and subscriptions return native shows", async () => {
 // Program IDs identify comments and saved queues; only mainSong IDs identify audio streams.
 test("podcast episodes keep their program identity while playing the underlying audio", async () => {
   const plugin = await setup((url, init) => {
+    if (url.pathname === "/api/nuser/account/get") return { code: 200, profile: { userId: 9 } };
+    if (url.pathname === "/weapi/feedback/weblog") {
+      assert.equal(init.method, "POST");
+      const form = new URLSearchParams(init.body);
+      assert.ok(form.get("params"));
+      assert.ok(form.get("encSecKey"));
+      return { code: 200 };
+    }
     if (url.pathname.startsWith("/api/v1/resource/comments/")) {
       assert.equal(url.pathname, "/api/v1/resource/comments/A_DJ_1_99");
       return { code: 200, comments: [], total: 0 };
@@ -395,8 +619,8 @@ test("podcast episodes keep their program identity while playing the underlying 
   assert.equal((await plugin.stream({ id: track.id, quality: "high" })).type, "mp3");
   await plugin.comments({ trackId: track.id, offset: 0 });
   assert.deepEqual(await plugin.lyrics({ id: track.id }), { lrc: "" });
-  plugin.played({ id: "7" });
-  plugin.played({ id: track.id });
+  await plugin.played({ id: "7" });
+  await plugin.played({ id: track.id });
   assert.equal(host.storage.get("lastPlayed"), "7");
   assert.deepEqual(host.storage.get("recent"), ["dj:99", "7"]);
   await assert.rejects(plugin.addToPlaylist({ id: "1", trackIds: [track.id] }), { code: "unsupported" });
@@ -419,6 +643,53 @@ test("podcast subscriptions write both directions and private tabs require login
   await assert.rejects(guest.shows(), { code: "signIn" });
   await assert.rejects(guest.browse({ page: "cloud" }), { code: "signIn" });
   await assert.rejects(guest.subscribeShow({ id: "8", on: true }), { code: "signIn" });
+});
+
+test("recent plays appears after liked music and shows the local history", async () => {
+  const plugin = await setup(url => {
+    assert.equal(url.pathname, "/api/v3/song/detail");
+    return { code: 200, songs: [song(7)] };
+  }, false);
+  const liked = manifest.navigation.findIndex(item => item.builtin === "liked");
+  assert.equal(manifest.navigation[liked + 1].page, "recent");
+  await plugin.played({ id: "7" });
+  const page = await plugin.browse({ page: "recent" });
+  assert.equal(page.title, "最近播放");
+  assert.deepEqual(page.sections[0].tracks.map(track => track.id), ["7"]);
+});
+
+test("song plays sync to NetEase listening history while podcast plays stay local", async () => {
+  const reports = [];
+  const plugin = await setup((url, init) => {
+    if (url.pathname === "/api/nuser/account/get") return { code: 200, profile: { userId: 9 } };
+    assert.equal(url.pathname, "/weapi/feedback/weblog");
+    assert.equal(init.method, "POST");
+    const form = new URLSearchParams(init.body);
+    assert.ok(form.get("params"));
+    assert.ok(form.get("encSecKey"));
+    reports.push(init.body);
+    return { code: 200 };
+  });
+  await plugin.played({ id: "42" });
+  await plugin.played({ id: "dj:99" });
+  assert.equal(reports.length, 1);
+  assert.deepEqual(host.storage.get("recent"), ["dj:99", "42"]);
+});
+
+test("existing local song history backfills once for the signed-in account", async () => {
+  const reports = [];
+  const plugin = await setup((url, init) => {
+    if (url.pathname === "/api/nuser/account/get") return { code: 200, profile: { userId: 9 } };
+    if (url.pathname === "/api/v3/song/detail") return { code: 200, songs: [song(41), song(42)] };
+    if (url.pathname === "/weapi/feedback/weblog") { reports.push(init.body); return { code: 200 }; }
+    if (url.pathname === "/weapi/v1/play/record") return { code: 200, allData: [], weekData: [] };
+    assert.fail(url.pathname);
+  });
+  host.storage.set("recent", ["42", "41"]);
+  await plugin.recent();
+  await plugin.recent();
+  assert.equal(reports.length, 1);
+  assert.deepEqual(host.storage.get("recentSynced:9"), ["41", "42"]);
 });
 
 // Uploaded files remain playable even when their matched catalog song has been removed.
@@ -455,8 +726,8 @@ test("recent history restores podcast episodes alongside songs", async () => {
     assert.equal(request(url, init).id, 99);
     return { code: 200, program };
   }, false);
-  plugin.played({ id: "7" });
-  plugin.played({ id: "dj:99" });
+  await plugin.played({ id: "7" });
+  await plugin.played({ id: "dj:99" });
   const tracks = await plugin.recent();
   assert.deepEqual(tracks.map(t => t.id), ["dj:99", "7"]);
   assert.equal(tracks[0].showId, "8");

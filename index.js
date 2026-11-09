@@ -10,7 +10,7 @@
 const site = "https://music.163.com";
 const clientSite = "https://interfacepc.music.163.com";
 const webUA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 
 // What its website says with every request, so the service answers as the
 // desktop site does.
@@ -204,27 +204,6 @@ async function weapi(path, payload) {
   return check(await res.json(), path);
 }
 
-// The same request, keeping the answer's headers: signing in answers with the
-// session as cookies, and with codes of its own rather than an error.
-async function weapiAnswer(path, payload, session) {
-  const body = new URLSearchParams();
-  body.set("params", paramsOf({ csrf_token: "", ...payload }));
-  body.set("encSecKey", encSecKey);
-  const res = await fetch(`${site}${path}`, {
-    method: "POST",
-    headers: {
-      "user-agent": webUA,
-      referer: `${site}/`,
-      origin: site,
-      cookie: session ? `${session}; ${clientCookie}` : clientCookie,
-      "content-type": "application/x-www-form-urlencoded",
-    },
-    body: body.toString(),
-  });
-  if (!res.ok) throw new Error(`${path}: ${res.status}`);
-  return { res, body: await res.json() };
-}
-
 // The cookies a response sets, by name, as a browser would keep them. The
 // separate lines are read where the runtime keeps them; a response that folds
 // them into one header is taken apart at the commas a cookie starts after.
@@ -247,7 +226,7 @@ const cookiesAsHeader = (jar) => Object.entries(jar).map(([name, value]) => `${n
 // no longer gets through: AES-ECB once, in hex, with an MD5 of the text
 // inside, and the caller's fields in the payload as `header`.
 
-const apiUA = "NeteaseMusic 9.0.90/5038 (iPhone; iOS 16.2; zh_CN)";
+const apiUA = "NeteaseMusic 3.1.17/204416 (Windows; 10.0; x64)";
 const eapiKey = "e82ckenh8dichen8";
 
 // Its anti-cheat token, which saving a playlist has to carry.
@@ -284,13 +263,24 @@ function eapiHeader() {
   };
 }
 
-async function eapi(uri, payload, antiCheat) {
+async function eapiAnswer(uri, payload, antiCheat, session) {
   const header = eapiHeader();
   if (antiCheat) header["X-antiCheatToken"] = checkToken;
-  // The client sends its session in both the encrypted header and Cookie.
-  for (const name of ["MUSIC_U", "MUSIC_A", "NMTID"]) {
-    const value = cookieValue(name);
-    if (value) header[name] = value;
+  if (session !== undefined) {
+    const values = Object.fromEntries(session.split(";").map((part) => {
+      const at = part.indexOf("=");
+      return at > 0 ? [part.slice(0, at).trim(), part.slice(at + 1).trim()] : ["", ""];
+    }).filter(([name]) => name));
+    header.__csrf = values.__csrf || "";
+    for (const name of ["MUSIC_U", "MUSIC_A", "NMTID"]) {
+      if (values[name]) header[name] = values[name];
+      else delete header[name];
+    }
+  } else {
+    for (const name of ["MUSIC_U", "MUSIC_A", "NMTID"]) {
+      const value = cookieValue(name);
+      if (value) header[name] = value;
+    }
   }
   const text = JSON.stringify({ ...payload, header, e_r: false });
   const digest = host.crypto.md5(`nobody${uri}use${text}md5forencrypt`);
@@ -308,7 +298,11 @@ async function eapi(uri, payload, antiCheat) {
     body: `params=${encodeURIComponent(params)}`,
   });
   if (!res.ok) throw new Error(`${uri}: ${res.status}`);
-  return check(await res.json(), uri);
+  return { res, body: await res.json() };
+}
+
+async function eapi(uri, payload, antiCheat) {
+  return check((await eapiAnswer(uri, payload, antiCheat)).body, uri);
 }
 
 // Answers, as the app knows them.
@@ -416,7 +410,7 @@ export async function signIn() {
   host.signInPrompt({ text: "正在获取登录二维码…" });
   let asked;
   try {
-    asked = await weapiAnswer("/weapi/login/qrcode/unikey", { type: 1 });
+    asked = await eapiAnswer("/api/login/qrcode/unikey", { type: 3 }, false, "");
   } catch (e) {
     throw fail("signIn", `拿不到登录二维码，请稍后再试：${e.message}`);
   }
@@ -434,7 +428,12 @@ export async function signIn() {
     if (run !== signInRun) return null;
     let answer;
     try {
-      answer = await weapiAnswer("/weapi/login/qrcode/client/login", { key, type: 1 }, cookiesAsHeader(jar));
+      answer = await eapiAnswer(
+        "/api/login/qrcode/client/login",
+        { key, type: 3 },
+        false,
+        cookiesAsHeader(jar),
+      );
     } catch (e) {
       // A poll the network dropped says nothing of the code: the next one asks
       // after the same key.
@@ -561,6 +560,7 @@ async function newAlbums(limit) {
 }
 
 export async function browse({ page }) {
+  if (page === "recent") return { title: "最近播放", sections: [{ tracks: await recent() }] };
   if (page === "charts") {
     const charts = await chartPlaylists();
     return {
@@ -582,6 +582,8 @@ export async function browse({ page }) {
   }
   if (page === "playlists") return playlistSquare();
   if (page === "podcasts") return podcastSquare();
+  const artistPage = /^artist-profile:(\d+)(?::(\d+))?$/.exec(page);
+  if (artistPage) return artistProfile(artistPage[1], Number(artistPage[2] || 0));
   if (page === "my-podcasts" || /^my-podcasts:(created|purchased|liked)(:\d+)?$/.test(page) || /^my-podcasts:subscribed:\d+$/.test(page)) return myPodcasts(page);
   if (page === "cloud" || /^cloud:\d+$/.test(page)) return cloudPage(Number(page.split(":")[1] || 0));
   throw fail("unavailable", `没有这个页面：${page}`);
@@ -592,6 +594,29 @@ async function playlistSquare() {
   return {
     title: "歌单广场",
     sections: [{ title: "热门歌单", playlists: (r.playlists || []).map(playlistOf) }],
+  };
+}
+
+async function artistProfile(id, offset) {
+  const [detail, playlists] = await Promise.all([
+    api("/api/user/detail", { uid: Number(id) }),
+    api("/api/user/playlist", { uid: Number(id), limit: 30, offset }),
+  ]);
+  const profile = detail.profile || {};
+  const entries = playlists.playlist || [];
+  const pages = [];
+  if (offset > 0) pages.push({ title: "上一页", page: `artist-profile:${id}:${Math.max(0, offset - 30)}` });
+  if ((playlists.more ?? playlists.hasMore ?? entries.length === 30) && entries.length) {
+    pages.push({ title: "下一页", page: `artist-profile:${id}:${offset + entries.length}` });
+  }
+  return {
+    title: profile.nickname || "网易云音乐用户",
+    imageUrl: pictureOf(profile.avatarUrl),
+    description: profile.signature || "",
+    sections: [
+      { title: "公开歌单", playlists: entries.map(playlistOf) },
+      ...(pages.length ? [{ links: pages }] : []),
+    ],
   };
 }
 
@@ -813,6 +838,8 @@ export async function upload({ file }) {
 
 const searchTypes = { tracks: 1, albums: 10, artists: 100, playlists: 1000, shows: 1009 };
 const searchPage = 30;
+const searchHasMore = (items, count, offset) =>
+  offset + items.length < (Number(count) || 0) || items.length === searchPage;
 
 export async function search({ query, kind, offset }) {
   const type = searchTypes[kind];
@@ -823,19 +850,19 @@ export async function search({ query, kind, offset }) {
   const out = { more: false };
   if (kind === "tracks") {
     out.tracks = tracksOf(result.songs);
-    out.more = offset + out.tracks.length < (result.songCount || 0);
+    out.more = searchHasMore(out.tracks, result.songCount, offset);
   } else if (kind === "albums") {
     out.albums = (result.albums || []).map(albumEntryOf);
-    out.more = offset + out.albums.length < (result.albumCount || 0);
+    out.more = searchHasMore(out.albums, result.albumCount, offset);
   } else if (kind === "artists") {
     out.artists = (result.artists || []).map(artistOf);
-    out.more = offset + out.artists.length < (result.artistCount || 0);
+    out.more = searchHasMore(out.artists, result.artistCount, offset);
   } else if (kind === "shows") {
     out.shows = (result.djRadios || []).map(showOf);
-    out.more = offset + out.shows.length < (result.djRadiosCount || 0);
+    out.more = searchHasMore(out.shows, result.djRadiosCount, offset);
   } else {
     out.playlists = (result.playlists || []).map(playlistOf);
-    out.more = offset + out.playlists.length < (result.playlistCount || 0);
+    out.more = searchHasMore(out.playlists, result.playlistCount, offset);
   }
   return out;
 }
@@ -871,21 +898,50 @@ export async function album({ id }) {
   };
 }
 
+async function artistItems(path, params, field, offset) {
+  if (!Number.isSafeInteger(offset) || offset < 0) throw fail("unavailable", "无效的歌手分页。");
+  const r = await api(path, { ...params, limit: 20, offset });
+  const items = r[field] || [];
+  return { items, more: Boolean(r.more) && items.length > 0, nextOffset: offset + items.length };
+}
+
+export async function artistTracks({ id, offset = 0 }) {
+  const page = await artistItems("/api/v1/artist/songs", { id: Number(id), private_cloud: "true", work_type: 1, order: "hot" }, "songs", offset);
+  return { tracks: tracksOf(page.items), more: page.more, nextOffset: page.nextOffset };
+}
+
+export async function artistAlbums({ id, offset = 0 }) {
+  const page = await artistItems(`/api/artist/albums/${id}`, { total: true }, "hotAlbums", offset);
+  return { albums: page.items.map(albumEntryOf), more: page.more, nextOffset: page.nextOffset };
+}
+
 export async function artist({ id }) {
-  const [detail, albums] = await Promise.all([
+  const [detail, songs, albums, description] = await Promise.all([
     api(`/api/v1/artist/${id}`),
-    api(`/api/artist/albums/${id}`, { limit: 12, offset: 0 }),
+    artistTracks({ id }),
+    artistAlbums({ id }),
+    weapi("/weapi/artist/introduction", { id: Number(id) }),
   ]);
   const a = detail.artist || {};
+  const d = description || {};
   return {
     artist: {
       id: String(a.id ?? id),
       name: a.name || "",
       imageUrl: pictureOf(a.picUrl),
+      aliases: a.alias || [],
+      trans: a.trans || "",
+      description: d.briefDesc || a.briefDesc || "",
+      details: (d.introduction || []).map(item => [item.name, item.txt].filter(Boolean).join("\n")),
+      userId: a.accountId ? String(a.accountId) : "",
       following: Boolean(a.followed) || undefined,
     },
-    tracks: tracksOf(detail.hotSongs).slice(0, 20),
-    albums: (albums.hotAlbums || []).map(albumEntryOf),
+    tracks: songs.tracks,
+    albums: albums.albums,
+    tracksMore: songs.more,
+    albumsMore: albums.more,
+    tracksNextOffset: songs.nextOffset,
+    albumsNextOffset: albums.nextOffset,
   };
 }
 
@@ -1004,17 +1060,46 @@ export async function like({ id, on }) {
 
 // What was played: the app's own list of it, and the service's when signed in.
 
-export function played({ id }) {
+export async function played({ id }) {
   if (!programIdOf(id)) host.storage.set("lastPlayed", id);
   const stored = host.storage.get("recent");
   const list = (Array.isArray(stored) ? stored : []).filter((x) => x !== id);
   list.unshift(id);
   host.storage.set("recent", list.slice(0, 100));
+  if (cookie() && /^\d+$/.test(String(id))) {
+    const who = await quietly(current(), null);
+    if (who) await syncRecentToCloud(who.id, String(id));
+  }
+}
+
+async function syncRecentToCloud(userId, playingId) {
+  const key = `recentSynced:${userId}`;
+  const previous = host.storage.get(key);
+  const history = host.storage.get("recent");
+  const synced = new Set((Array.isArray(previous) ? previous : []).map(String));
+  const ids = [...new Set((Array.isArray(history) ? history : []).map(String))]
+    .filter((id) => /^\d+$/.test(id) && (id === playingId || !synced.has(id)))
+    .reverse();
+  if (!ids.length) return;
+  const logs = ids.map((id) => ({
+    action: "play",
+    json: { id, type: "song", source: "list", time: 0, end: "playend", wifi: 0, download: 0 },
+  }));
+  try {
+    await weapi("/weapi/feedback/weblog", { logs: JSON.stringify(logs) });
+    host.storage.set(key, [...new Set([...synced, ...ids])].slice(-100));
+  } catch (e) {
+    console.warn(`网易云音乐的播放记录: ${e.message}`);
+  }
 }
 
 export async function recent() {
   const stored = host.storage.get("recent");
   const local = (Array.isArray(stored) ? stored : []).map(String);
+  if (cookie()) {
+    const who = await quietly(current(), null);
+    if (who) await syncRecentToCloud(who.id);
+  }
   const out = [];
   const seen = new Set();
   if (local.length) {
