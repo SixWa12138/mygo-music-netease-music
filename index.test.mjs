@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createCipheriv, createDecipheriv, createHash } from "node:crypto";
+import { constants, createCipheriv, createDecipheriv, createHash, publicEncrypt } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
@@ -47,6 +47,27 @@ function request(url, init) {
 }
 
 const song = id => ({ id, name: `Song ${id}`, ar: [], al: {}, dt: 180000 });
+
+const weapiPublicKey = `-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDgtQn2JZ34ZC28NWYpAUd98iZ37BUrX/aKzmFbt7clFSs6sXqHauqKWqdtLkF2KexO40H1YTX8z2lSgBBOAxLsvaklV8k4cBFK9snQXE9/DDaFt6Rr7iVZMldczhC0JNgTz+SHXT6CBHuX3e9SdB1Ua44oncaTWz7OBGLbCiK45wIDAQAB
+-----END PUBLIC KEY-----`;
+
+function weapiRequest(init, secretKey) {
+  const form = new URLSearchParams(init.body);
+  const padded = Buffer.alloc(128);
+  Buffer.from(secretKey.split("").reverse().join("")).copy(padded, 112);
+  assert.equal(form.get("encSecKey"), publicEncrypt({ key: weapiPublicKey, padding: constants.RSA_NO_PADDING }, padded).toString("hex"));
+  const decrypt = (key, text) => {
+    const cipher = createDecipheriv("aes-128-cbc", key, "0102030405060708");
+    return Buffer.concat([cipher.update(text, "base64"), cipher.final()]).toString("utf8");
+  };
+  return JSON.parse(decrypt("0CoJUm6Qyw8W8jud", decrypt(secretKey, form.get("params"))));
+}
+
+const requestCookies = init => Object.fromEntries(init.headers.cookie.split("; ").map(part => {
+  const at = part.indexOf("=");
+  return [decodeURIComponent(part.slice(0, at)), decodeURIComponent(part.slice(at + 1))];
+}));
 
 test("QR sign-in starts through the PC client endpoint", async () => {
   const plugin = await setup((url, init) => {
@@ -160,7 +181,8 @@ test("full song, artist and album search pages continue when the service omits c
 });
 
 // The old /artist/desc request fails; use /artist/introduction with the encrypted artist ID.
-test("artist pages expose aliases, full introduction and a linked account profile", async () => {
+test("artist pages expose aliases, full introduction and a linked account profile", async (t) => {
+  t.mock.method(Math, "random", () => 0);
   const plugin = await setup((url, init) => {
     if (url.pathname === "/api/v1/artist/12") {
       return { code: 200, artist: { id: 12, name: "Artist", alias: ["Alias"], trans: "Original", accountId: 34 } };
@@ -170,15 +192,9 @@ test("artist pages expose aliases, full introduction and a linked account profil
     if (url.pathname === "/api/artist/desc") return { code: 400, msg: "参数错误" };
     if (url.pathname === "/weapi/artist/introduction") {
       assert.equal(init.method, "POST");
-      const form = new URLSearchParams(init.body);
-      const decrypt = (key, text) => {
-        const cipher = createDecipheriv("aes-128-cbc", key, "0102030405060708");
-        return Buffer.concat([cipher.update(text, "base64"), cipher.final()]).toString("utf8");
-      };
-      const body = JSON.parse(decrypt("0CoJUm6Qyw8W8jud", decrypt("mygomusicnetease", form.get("params"))));
+      const body = weapiRequest(init, "a".repeat(16));
       assert.equal(body.id, 12);
       assert.equal(body.csrf_token, "test-csrf");
-      assert.ok(form.get("encSecKey"));
       return { code: 200, briefDesc: "Short bio", introduction: [{ name: "Career", txt: "Long bio" }] };
     }
     if (url.pathname === "/api/user/detail") return { code: 200, profile: { nickname: "Artist account", avatarUrl: "http://p1.music.126.net/avatar.jpg", signature: "Profile bio" } };
@@ -439,6 +455,149 @@ test("a rejected heart preserves the cached liked state", async () => {
   }
   const guest = await setup(() => assert.fail("A signed-out heart must not send a request"), false);
   await assert.rejects(guest.like({ id: "42", on: true }), { code: "signIn" });
+});
+
+test("comment likes use separate endpoints and preserve song and podcast comment IDs", async (t) => {
+  t.mock.method(Math, "random", () => 0);
+  for (const [trackId, threadId] of [["42", "R_SO_4_42"], ["dj:99", "A_DJ_1_99"]]) {
+    const changes = [];
+    const commentId = "9007199254740993";
+    const plugin = await setup((url, init) => {
+      assert.equal(url.origin, "https://music.163.com");
+      assert.equal(init.method, "POST");
+      assert.match(init.headers.cookie, /MUSIC_U=test-session/);
+      const body = weapiRequest(init, "a".repeat(16));
+      assert.deepEqual(body, { csrf_token: "test-csrf", threadId, commentId, e_r: false });
+      assert.ok(["/weapi/v1/comment/like", "/weapi/v1/comment/unlike"].includes(url.pathname));
+      changes.push(url.pathname);
+      return { code: 200 };
+    });
+    await plugin.likeComment({ trackId, commentId, on: true });
+    await plugin.likeComment({ trackId, commentId, on: false });
+    assert.deepEqual(changes, ["/weapi/v1/comment/like", "/weapi/v1/comment/unlike"]);
+  }
+});
+
+test("weapi aligns headers, device cookies and fresh RSA-wrapped keys with api-enhanced", async (t) => {
+  let sample = 0;
+  const random = t.mock.method(Math, "random", () => ((++sample * 17) % 97) / 97);
+  const requests = [];
+  const plugin = await setup((url, init) => {
+    assert.equal(url.href, "https://music.163.com/weapi/v1/comment/like");
+    assert.deepEqual(init.headers, {
+      "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+      referer: "https://music.163.com",
+      accept: "application/json, text/plain, */*",
+      "content-type": "application/x-www-form-urlencoded",
+      cookie: init.headers.cookie,
+    });
+    const cookies = requestCookies(init);
+    assert.equal(cookies.MUSIC_U, "test-session");
+    assert.equal(cookies.__csrf, "test-csrf");
+    assert.equal(cookies.NMTID, "test-device");
+    assert.equal(cookies.__remember_me, "true");
+    assert.equal(cookies.ntes_kaola_ad, "1");
+    assert.match(cookies._ntes_nuid, /^[0-9a-f]{64}$/);
+    assert.match(cookies._ntes_nnid, new RegExp(`^${cookies._ntes_nuid},\\d+$`));
+    assert.match(cookies.WNMCID, /^[a-z]{6}\.\d+\.01\.0$/);
+    assert.equal(cookies.WEVNSM, "1.0.0");
+    assert.match(cookies.deviceId, /^[0-9A-F]{52}$/);
+    assert.equal(cookies.os, "pc");
+    assert.equal(cookies.appver, "3.1.17.204416");
+    assert.equal(cookies.osver, "Microsoft-Windows-10-Professional-build-19045-64bit");
+    assert.equal(cookies.channel, "netease");
+    const secret = random.mock.calls.slice(-16).map(call => "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[Math.round(call.result * 61)]).join("");
+    assert.deepEqual(weapiRequest(init, secret), { threadId: "R_SO_4_42", commentId: "123", e_r: false, csrf_token: "test-csrf" });
+    requests.push({ body: init.body, cookies });
+    return { code: 200 };
+  });
+  for (let i = 0; i < 2; i++) await plugin.likeComment({ trackId: "42", commentId: "123", on: true });
+  const [first, second] = requests;
+  assert.notEqual(new URLSearchParams(first.body).get("params"), new URLSearchParams(second.body).get("params"));
+  assert.notEqual(new URLSearchParams(first.body).get("encSecKey"), new URLSearchParams(second.body).get("encSecKey"));
+  assert.notEqual(first.cookies._ntes_nuid, second.cookies._ntes_nuid);
+  assert.equal(first.cookies.WNMCID, second.cookies.WNMCID);
+  assert.equal(first.cookies.deviceId, second.cookies.deviceId);
+  const storage = host.storage;
+  const reloaded = await setup((url, init) => {
+    assert.equal(requestCookies(init).deviceId, first.cookies.deviceId);
+    return { code: 200 };
+  });
+  host.storage = storage;
+  await reloaded.likeComment({ trackId: "42", commentId: "123", on: false });
+});
+
+test("weapi preserves supplied cookies and encodes names and values like api-enhanced", async () => {
+  const supplied = {
+    MUSIC_U: "session/with+padding==", __csrf: "csrf+value", NMTID: "existing-device",
+    _ntes_nuid: "existing-nuid", _ntes_nnid: "existing-nnid,123", WNMCID: "existing-wnmcid",
+    WEVNSM: "2.0.0", deviceId: "existing-device-id", os: "pc", appver: "custom-version",
+    osver: "Windows 10 + custom", channel: "custom-channel", "custom name": "value=with&symbols",
+  };
+  const plugin = await setup((url, init) => {
+    assert.deepEqual(requestCookies(init), { ...supplied, __remember_me: "true", ntes_kaola_ad: "1" });
+    for (const [key, value] of Object.entries(supplied)) assert.ok(init.headers.cookie.split("; ").includes(`${encodeURIComponent(key)}=${encodeURIComponent(value)}`));
+    return { code: 200 };
+  });
+  host.storage.set("cookie", Object.entries({ ...supplied, __remember_me: "false", ntes_kaola_ad: "0" }).map(([key, value]) => `${key}=${value}`).join("; "));
+  await plugin.likeComment({ trackId: "42", commentId: "123", on: true });
+});
+
+test("weapi supplies the api-enhanced NMTID fallback without replacing the eapi device", async () => {
+  const plugin = await setup((url, init) => {
+    assert.match(requestCookies(init).NMTID, /^00O[0-9a-f]{38}$/);
+    return { code: 200 };
+  });
+  host.storage.set("cookie", "MUSIC_U=test-session; __csrf=test-csrf");
+  host.storage.set("deviceId", "existing-eapi-device");
+  await plugin.likeComment({ trackId: "42", commentId: "123", on: true });
+  assert.equal(host.storage.get("deviceId"), "existing-eapi-device");
+});
+
+test("posting song and podcast comments uses authenticated eapi with an anti-cheat token", async () => {
+  for (const [trackId, threadId] of [["42", "R_SO_4_42"], ["dj:99", "A_DJ_1_99"]]) {
+    const text = "评论测试 🎵\n第二行";
+    const plugin = await setup((url, init) => {
+      const body = request(url, init);
+      assert.equal(url.pathname, "/eapi/resource/comments/add");
+      assert.equal(body.threadId, threadId);
+      assert.equal(body.content, text);
+      assert.equal(body.header.MUSIC_U, "test-session");
+      assert.equal(body.header.__csrf, "test-csrf");
+      assert.ok(body.header["X-antiCheatToken"]);
+      assert.ok(init.headers.cookie.includes(`X-antiCheatToken=${encodeURIComponent(body.header["X-antiCheatToken"])}`));
+      return { code: 200, comment: { commentId: "9007199254740993", user: { nickname: "Listener" }, content: text, time: 1767225600000 } };
+    });
+    assert.deepEqual(await plugin.postComment({ trackId, text }), {
+      id: "9007199254740993", author: "Listener", text, time: 1767225600000,
+    });
+  }
+});
+
+test("comment mutations require login and propagate upstream failures", async () => {
+  const params = { trackId: "42", commentId: "123", on: true, text: "评论测试" };
+  const guest = await setup(() => assert.fail("Signed-out comments must not send a request"), false);
+  await assert.rejects(guest.likeComment(params), { code: "signIn" });
+  await assert.rejects(guest.postComment(params), { code: "signIn" });
+  for (const code of [301, 405]) {
+    const plugin = await setup(() => ({ code }));
+    await assert.rejects(plugin.likeComment(params), code === 301 ? { code: "signIn" } : /405/);
+    await assert.rejects(plugin.postComment(params), code === 301 ? { code: "signIn" } : /405/);
+  }
+});
+
+test("comment mutations reject HTTP errors, invalid responses and network failures", async () => {
+  for (const method of ["likeComment", "postComment"]) {
+    for (const [response, expected] of [
+      [() => new Response(JSON.stringify({ code: 403, message: "请求被拒绝" }), { status: 403 }), /403/],
+      [() => new Response("<html>upstream unavailable</html>", { status: 502 }), /502/],
+      [() => new Response("not JSON"), SyntaxError],
+      [() => { throw new Error("network offline"); }, /network offline/],
+    ]) {
+      const plugin = await setup(response);
+      await assert.rejects(plugin[method]({ trackId: "42", commentId: "123", on: false, text: "评论测试" }), expected);
+    }
+  }
 });
 
 // Playback must use the requested client quality and keep login cookies out of CDN requests.
