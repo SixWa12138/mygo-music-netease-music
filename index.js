@@ -1,8 +1,7 @@
 // 网易云音乐, for personal use. The catalog is the API its website calls: most
 // of it is plain, and what changes your library, or asks for it, goes as the
-// website sends it, encrypted with a key made up here once rather than per
-// request, as the service only takes the key back out of the RSA that carried
-// it. A track plays from the address its player is handed, so nothing is
+// website sends it, encrypted with a fresh key for each request. A track
+// plays from the address its player is handed, so nothing is
 // converted: the app plays that as it is. A session, signed in by scanning a
 // code the app shows with the phone, is what answers your library, and what
 // makes VIP songs play whole rather than their first 45 seconds.
@@ -73,13 +72,8 @@ async function api(path, params) {
 // library, playlists, comments, saving.
 
 const presetKey = "0CoJUm6Qyw8W8jud";
-const signKey = "mygomusicnetease";
 const cbcIv = "0102030405060708";
-
-// Its RSA of signKey, padded the way its website pads it and worked out once:
-// the service doesn't care that the key is the same every time.
-const encSecKey =
-  "45444455c61d00fca7cbcefe0c02b432c6b5bba3596f088d887948034bdfaf041c51cd6d7796ac9a542e5f1456f11c47f9228ca81d71cf5bfd40756553fb531f3c1dda387a166ac5ea362b5b53cccdad1145689d1add3b0af61b17e1aea903c49dc0f8cb2a6e1f234f7df2a506063a31d123f3825220461ca6ef29141f9bf33e";
+const rsaModulus = BigInt("0xe0b509f6259df8642dbc35662901477df22677ec152b5ff68ace615bb7b725152b3ab17a876aea8a5aa76d2e417629ec4ee341f56135fccf695280104e0312ecbda92557c93870114af6c9d05c4f7f0c3685b7a46bee255932575cce10b424d813cfe4875d3e82047b97ddef52741d546b8e289dc6935b3ece0462db0a22b8e7");
 
 // AES-128-CBC, which the runtime doesn't have, in the small way its requests
 // need: a block at a time, with the chaining around it.
@@ -189,15 +183,80 @@ function aesCbc(key, text) {
   return toBase64(new Uint8Array(out));
 }
 
-const paramsOf = (payload) => aesCbc(signKey, aesCbc(presetKey, JSON.stringify(payload)));
+const weapiUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0";
+const weapiOS = {
+  pc: { os: "pc", appver: "3.1.17.204416", osver: "Microsoft-Windows-10-Professional-build-19045-64bit", channel: "netease" },
+  linux: { os: "linux", appver: "1.2.1.0428", osver: "Deepin 20.9", channel: "netease" },
+  android: { os: "android", appver: "8.20.20.231215173437", osver: "14", channel: "xiaomi" },
+  iphone: { os: "iPhone OS", appver: "9.0.90", osver: "16.2", channel: "distribution" },
+  osx: { os: "osx", appver: "3.1.10.5100", osver: "15.5", channel: "netease" },
+};
+
+function randomString(length, alphabet) {
+  let text = "";
+  for (let i = 0; i < length; i++) text += alphabet[Math.floor(Math.random() * alphabet.length)];
+  return text;
+}
+
+const weapiWNMCID = `${randomString(6, "abcdefghijklmnopqrstuvwxyz")}.${Date.now()}.01.0`;
+
+function weapiHeaders() {
+  const values = Object.fromEntries(cookie().split(";").map(part => {
+    const at = part.indexOf("=");
+    return at > 0 ? [part.slice(0, at).trim(), part.slice(at + 1).trim()] : ["", ""];
+  }).filter(([name]) => name));
+  const os = weapiOS[values.os] || weapiOS.pc;
+  const nuid = randomString(64, "0123456789abcdef");
+  let webDevice = values.deviceId || host.storage.get("weapiDeviceId");
+  if (!webDevice) {
+    webDevice = randomString(52, "0123456789ABCDEF");
+    host.storage.set("weapiDeviceId", webDevice);
+  }
+  const processed = {
+    ...values,
+    __remember_me: "true",
+    ntes_kaola_ad: "1",
+    _ntes_nuid: values._ntes_nuid || nuid,
+    _ntes_nnid: values._ntes_nnid || `${nuid},${Date.now()}`,
+    WNMCID: values.WNMCID || weapiWNMCID,
+    WEVNSM: values.WEVNSM || "1.0.0",
+    osver: values.osver || os.osver,
+    deviceId: webDevice,
+    os: values.os || os.os,
+    channel: values.channel || os.channel,
+    appver: values.appver || os.appver,
+    NMTID: values.NMTID || `00O${randomString(38, "0123456789abcdef")}`,
+  };
+  return {
+    "user-agent": weapiUA,
+    referer: site,
+    accept: "application/json, text/plain, */*",
+    "content-type": "application/x-www-form-urlencoded",
+    cookie: Object.entries(processed).map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`).join("; "),
+  };
+}
+
+function rsaEncrypt(secretKey) {
+  let value = BigInt(`0x${secretKey.split("").reverse().map(c => c.charCodeAt(0).toString(16)).join("")}`);
+  let result = BigInt(1);
+  for (let power = 65537; power > 0; power = Math.floor(power / 2)) {
+    if (power % 2) result = result * value % rsaModulus;
+    value = value * value % rsaModulus;
+  }
+  return result.toString(16).padStart(256, "0");
+}
 
 async function weapi(path, payload) {
+  const requestHeaders = weapiHeaders();
+  const base62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  let secretKey = "";
+  for (let i = 0; i < 16; i++) secretKey += base62[Math.round(Math.random() * 61)];
   const body = new URLSearchParams();
-  body.set("params", paramsOf({ csrf_token: cookieValue("__csrf"), ...payload }));
-  body.set("encSecKey", encSecKey);
+  body.set("params", aesCbc(secretKey, aesCbc(presetKey, JSON.stringify({ ...payload, e_r: false, csrf_token: cookieValue("__csrf") }))));
+  body.set("encSecKey", rsaEncrypt(secretKey));
   const res = await fetch(`${site}${path}`, {
     method: "POST",
-    headers: headers({ "content-type": "application/x-www-form-urlencoded" }),
+    headers: requestHeaders,
     body: body.toString(),
   });
   if (!res.ok) throw new Error(`${path}: ${res.status}`);
@@ -229,7 +288,7 @@ const cookiesAsHeader = (jar) => Object.entries(jar).map(([name, value]) => `${n
 const apiUA = "NeteaseMusic 3.1.17/204416 (Windows; 10.0; x64)";
 const eapiKey = "e82ckenh8dichen8";
 
-// Its anti-cheat token, which saving a playlist has to carry.
+// Its anti-cheat token, which posting a comment or saving a playlist has to carry.
 const checkToken =
   "9ca17ae2e6ffcda170e2e6ee8af14fbabdb988f225b3868eb2c15a879b9a83d274a790ac8ff54a97b889d5d42af0feaec3b92af58cff99c470a7eafd88f75e839a9ea7c14e909da883e83fb692a3abdb6b92adee9e";
 
@@ -1204,12 +1263,12 @@ export async function comments({ trackId, offset }) {
 
 export async function likeComment({ trackId, commentId, on }) {
   needAccount();
-  await weapi("/weapi/v1/comment/like", { threadId: threadOf(trackId), commentId: Number(commentId), like: Boolean(on) });
+  await weapi(`/weapi/v1/comment/${on ? "like" : "unlike"}`, { threadId: threadOf(trackId), commentId });
 }
 
 export async function postComment({ trackId, text }) {
   needAccount();
-  const r = await weapi("/weapi/resource/comments/add", { threadId: threadOf(trackId), content: text });
+  const r = await eapi("/api/resource/comments/add", { threadId: threadOf(trackId), content: text }, true);
   const c = r.comment || {};
   return {
     id: String(c.commentId || Date.now()),
