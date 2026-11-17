@@ -394,8 +394,7 @@ function albumEntryOf(a) {
   };
 }
 
-// A track whose copyright is gone is still listed, greyed out, as its website
-// lists it.
+// Keep catalog restrictions separate from the optional external fallback.
 function unavailableOf(s) {
   // A catalog restriction does not rule out the listener's uploaded copy.
   if (s.pc) return false;
@@ -404,14 +403,17 @@ function unavailableOf(s) {
 
 function trackOf(s) {
   if (!s || !s.id) return null;
+  const external = lxConfigured();
+  const restricted = unavailableOf(s);
+  if (external) rememberLxTrack(s);
   return {
     id: String(s.id),
-    name: s.name || "",
+    name: `${s.name || ""}${restricted && external ? " [外部音源]" : ""}`,
     artists: (s.ar || s.artists || []).map(artistOf),
     album: albumOf(s.al || s.album),
     duration: Number(s.dt || s.duration || 0),
     url: `${site}/song?id=${s.id}`,
-    unavailable: unavailableOf(s) || undefined,
+    unavailable: (restricted && !external) || undefined,
   };
 }
 
@@ -1334,11 +1336,26 @@ export async function stream({ id, quality }) {
   // A level the listener's membership doesn't reach comes back as a lower one,
   // or as nothing: the one below it is worth trying.
   const choices = [levels.lossless, levels.high, levels.standard];
-  for (const step of choices.slice(choices.indexOf(asked))) {
-    found = await audioOf(id, step.level, step.encode);
-    if (found) break;
+  let nativeError;
+  try {
+    for (const step of choices.slice(choices.indexOf(asked))) {
+      found = await audioOf(id, step.level, step.encode);
+      if (found) break;
+    }
+  } catch (error) {
+    nativeError = error;
   }
-  if (!found) throw fail("unavailable", "这首歌没有可播放的地址：可能已下架，或者需要会员。");
+  if (!found) {
+    if (!programId && lxConfigured()) {
+      try {
+        return await lxStream(id, quality);
+      } catch (error) {
+        throw fail("unavailable", `${nativeError ? `${nativeError.message}；` : "网易云没有可播放的地址；"}外部音源：${error.message}`);
+      }
+    }
+    if (nativeError) throw nativeError;
+    throw fail("unavailable", "这首歌没有可播放的地址：可能已下架，或者需要会员。");
+  }
   return {
     url: pictureOf(found.url),
     type: String(found.type).toLowerCase() === "flac" ? "flac" : "mp3",
@@ -1349,6 +1366,323 @@ export async function stream({ id, quality }) {
     peak: finite(found.peak),
     headers: { "user-agent": webUA, referer: `${site}/` },
   };
+}
+
+// LX custom sources only resolve URLs; NetEase IDs map directly to source wy.
+const lxQualities = {
+  standard: ["128k"],
+  high: ["320k", "192k", "128k"],
+  lossless: ["flac", "flac24bit", "hires", "320k", "192k", "128k"],
+};
+const lxTracks = new Map();
+let lxLoaded = null;
+let lxLoading = null;
+
+const lxSettingKeys = ["scriptUrls", "scriptUrl2", "scriptUrl3", "scriptUrl4", "scriptUrl5"];
+const lxConfigured = () => lxSettingKeys.some(key => host.setting(key)?.trim());
+
+export function setSetting({ key }) {
+  if (lxSettingKeys.includes(key)) {
+    lxLoaded = null;
+    lxLoading = null;
+  }
+}
+
+function rememberLxTrack(song) {
+  const id = String(song.id);
+  const album = song.al || song.album || {};
+  lxTracks.delete(id);
+  lxTracks.set(id, {
+    source: "wy", id, songmid: id, songId: id,
+    name: song.name || "",
+    singer: (song.ar || song.artists || []).map(a => a.name).join(", "),
+    albumName: album.name || "", albumId: String(album.id || ""),
+    img: pictureOf(album.picUrl) || "", interval: Number(song.dt || song.duration || 0),
+  });
+  if (lxTracks.size > 600) lxTracks.delete(lxTracks.keys().next().value);
+}
+
+async function lxDeadline(work, ms, cancel = () => {}, signal) {
+  let timer;
+  let onAbort;
+  try {
+    const tasks = [
+      Promise.resolve().then(work),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          reject(new Error(`等待音源超时（${ms / 1000} 秒）`));
+          cancel();
+        }, ms);
+      }),
+    ];
+    if (signal) tasks.push(new Promise((_, reject) => {
+      onAbort = () => reject(new Error("音源请求已取消"));
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }));
+    return await Promise.race(tasks);
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+// Each callback has its own timer and cancellation, including during initialization.
+function lxRequest(url, options, callback, pending) {
+  const settings = options || {};
+  const controller = new AbortController();
+  const requestHeaders = new Headers(settings.headers || {});
+  if (!requestHeaders.has("user-agent")) requestHeaders.set("user-agent", webUA);
+  const init = { method: settings.method || "GET", headers: requestHeaders, signal: controller.signal };
+  if (settings.body != null) init.body = typeof settings.body === "string" ? settings.body : JSON.stringify(settings.body);
+  else if (settings.form) {
+    init.body = new URLSearchParams(settings.form).toString();
+    if (!requestHeaders.has("content-type")) requestHeaders.set("content-type", "application/x-www-form-urlencoded");
+  } else if (settings.formData) {
+    init.body = new FormData();
+    for (const [key, value] of Object.entries(settings.formData)) init.body.append(key, value);
+  }
+  let cancelled = false;
+  const cancel = () => { cancelled = true; controller.abort(); };
+  pending.add(cancel);
+  const timeout = Number(settings.timeout) > 0 ? Math.min(Number(settings.timeout), 10000) : 10000;
+  lxDeadline(async () => {
+    const response = await fetch(url, init);
+    const text = await response.text();
+    let body = text;
+    try { body = JSON.parse(text); } catch {}
+    return { statusCode: response.status, headers: Object.fromEntries(response.headers), body };
+  }, timeout, () => controller.abort(), controller.signal).then(
+    response => { if (!cancelled) callback(null, response, response.body); },
+    error => { if (!cancelled) callback(error); },
+  ).catch(error => console.warn(`洛雪音源回调：${error.message}`)).finally(() => pending.delete(cancel));
+  return cancel;
+}
+
+// A small Buffer bridge for the encodings used by LX scripts.
+function lxBytes(value, encoding = "utf8") {
+  let bytes;
+  const format = String(encoding).toLowerCase().replace(/[-_]/g, "");
+  if (typeof value !== "string") {
+    bytes = value instanceof ArrayBuffer ? new Uint8Array(value)
+      : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength)
+      : new Uint8Array(value || 0);
+  } else if (format === "hex") {
+    bytes = new Uint8Array((value.match(/../g) || []).map(pair => parseInt(pair, 16)));
+  } else if (format === "base64") {
+    const text = value.replace(/[^A-Za-z0-9+/]/g, "");
+    const out = [];
+    for (let at = 0; at < text.length; at += 4) {
+      const n = (base64Alphabet.indexOf(text[at]) << 18) | (base64Alphabet.indexOf(text[at + 1]) << 12)
+        | ((at + 2 < text.length ? base64Alphabet.indexOf(text[at + 2]) : 0) << 6)
+        | (at + 3 < text.length ? base64Alphabet.indexOf(text[at + 3]) : 0);
+      out.push((n >> 16) & 255);
+      if (at + 2 < text.length) out.push((n >> 8) & 255);
+      if (at + 3 < text.length) out.push(n & 255);
+    }
+    bytes = new Uint8Array(out);
+  } else if (format === "latin1" || format === "binary") {
+    bytes = new Uint8Array([...value].map(char => char.charCodeAt(0) & 255));
+  } else bytes = utf8.encode(value);
+  // Define an own method: the host freezes built-in prototypes.
+  Object.defineProperty(bytes, "toString", { value: function (format) { return lxText(this, format); }, configurable: true });
+  return bytes;
+}
+
+function lxText(bytes, encoding = "utf8") {
+  const format = String(encoding).toLowerCase().replace(/[-_]/g, "");
+  if (format === "hex") return [...bytes].map(byte => byte.toString(16).padStart(2, "0")).join("");
+  if (format === "base64") return toBase64(bytes);
+  if (format === "latin1" || format === "binary") return [...bytes].map(byte => String.fromCharCode(byte)).join("");
+  return new TextDecoder().decode(bytes);
+}
+
+const lxBuffer = {
+  from: lxBytes,
+  alloc: size => lxBytes(new Uint8Array(size)),
+  isBuffer: value => value instanceof Uint8Array && Object.hasOwn(value, "toString"),
+  concat(list, size = list.reduce((sum, bytes) => sum + bytes.length, 0)) {
+    const out = new Uint8Array(size);
+    let at = 0;
+    for (const bytes of list) {
+      out.set(bytes.subarray(0, Math.max(0, size - at)), at);
+      at += Math.min(bytes.length, size - at);
+    }
+    return lxBytes(out);
+  },
+};
+
+function lxUtils() {
+  const unsupported = name => { throw new Error(`洛雪音源不支持 ${name}`); };
+  return {
+    buffer: { from: lxBytes, bufToString: (buffer, format) => lxText(lxBytes(buffer), format) },
+    crypto: {
+      md5: text => host.crypto.md5(String(text)),
+      randomBytes(size) {
+        const bytes = new Uint8Array(size);
+        if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes);
+        else for (let at = 0; at < size; at++) bytes[at] = Math.floor(Math.random() * 256);
+        return [...bytes].map(byte => (byte & 15).toString(16)).join("");
+      },
+      aesEncrypt(buffer, mode, key) {
+        if (!/^aes-(128|192|256)-ecb$/i.test(mode)) return unsupported(mode);
+        return lxBytes(host.crypto.aesEcbEncrypt(typeof key === "string" ? key : lxText(key), lxText(lxBytes(buffer))), "hex");
+      },
+      rsaEncrypt: () => unsupported("RSA"),
+    },
+    zlib: { inflate: () => unsupported("zlib"), deflate: () => unsupported("zlib") },
+  };
+}
+
+async function compileLx(code) {
+  const info = { rawScript: code };
+  for (const key of ["name", "version", "author", "description", "homepage"]) {
+    info[key] = new RegExp(`@${key}\\s+([^\\r\\n]+)`).exec(code)?.[1].trim() || "";
+  }
+  const handlers = [];
+  const pending = new Set();
+  const cancel = () => { for (const stop of pending) stop(); };
+  let initialized;
+  const ready = new Promise(resolve => { initialized = resolve; });
+  const lx = {
+    version: "2.0.0", env: "desktop", currentScriptInfo: info,
+    EVENT_NAMES: { request: "request", inited: "inited", updateAlert: "updateAlert" },
+    on(name, handler) { if (name === "request" && typeof handler === "function") handlers.push(handler); },
+    send(name, data) { if (name === "inited") initialized(data || {}); return Promise.resolve(); },
+    request: (url, options, callback) => lxRequest(url, options, callback, pending),
+    utils: lxUtils(),
+  };
+  const require = name => {
+    if (name === "buffer") return { Buffer: lxBuffer };
+    if (name === "crypto") return {
+      createHash(algorithm) {
+        if (String(algorithm).toLowerCase() !== "md5") throw new Error(`洛雪音源不支持摘要 ${algorithm}`);
+        let text = "";
+        return {
+          update(value) { text += typeof value === "string" ? value : lxText(value); return this; },
+          digest(format) {
+            const bytes = lxBytes(host.crypto.md5(text), "hex");
+            return format ? bytes.toString(format) : bytes;
+          },
+        };
+      },
+    };
+    throw new Error(`洛雪音源不支持 require("${name}")`);
+  };
+  // This is a compatibility scope, not a security sandbox. Only load trusted scripts.
+  const scope = Object.create(globalThis);
+  Object.defineProperties(scope, {
+    lx: { value: lx }, host: { value: undefined },
+    process: { value: { env: {}, platform: host.platform === "windows" ? "win32" : host.platform, arch: host.arch, nextTick: fn => setTimeout(fn, 0) } },
+  });
+  const module = { exports: {} };
+  try {
+    new Function("globalThis", "lx", "module", "exports", "require", "Buffer", "host", "process", "window", "self", "global", `return (function () {\n${code}\n}).call(globalThis);\n//# sourceURL=netease-lx-source.js`)(
+      scope, lx, module, module.exports, require, lxBuffer, undefined, scope.process, scope, scope, scope,
+    );
+    const sources = module.exports?.sources || (await lxDeadline(() => ready, 5000, cancel)).sources;
+    const entry = sources?.wy;
+    if (!entry || entry.type === "local" || (!handlers.length && typeof entry.musicUrl !== "function")) {
+      throw new Error("这个音源不支持获取网易云歌曲的播放地址");
+    }
+    if (entry.actions && !entry.actions.includes("musicUrl")) throw new Error("这个音源不支持获取网易云歌曲的播放地址");
+    return { entry, handlers, cancel, code, busy: false };
+  } catch (error) {
+    cancel();
+    throw error;
+  }
+}
+
+async function loadedLx() {
+  // Older player settings flatten pasted newlines into spaces.
+  const urls = [...new Set(lxSettingKeys.flatMap(key => String(host.setting(key) || "").trim().split(/\s+/)).filter(Boolean))];
+  const key = JSON.stringify(urls);
+  if (lxLoaded?.key === key && Date.now() - lxLoaded.at < 10 * 60 * 1000) return lxLoaded;
+  if (lxLoading?.key === key) return lxLoading.promise;
+  const promise = (async () => {
+    const tasks = urls.map(async url => {
+      if (!/^https?:$/.test(new URL(url).protocol)) throw new Error("脚本地址必须是 HTTP(S) 直链");
+      const controller = new AbortController();
+      const code = await lxDeadline(async () => {
+        const response = await fetch(url, { headers: { "user-agent": webUA }, signal: controller.signal });
+        if (!response.ok) throw new Error(`下载音源脚本失败（HTTP ${response.status}）`);
+        return response.text();
+      }, 5000, () => controller.abort());
+      if (!code.trim()) throw new Error("音源脚本为空");
+      return compileLx(code);
+    });
+    const answers = await Promise.allSettled(tasks);
+    const runtimes = [];
+    const errors = [];
+    answers.forEach((answer, index) => {
+      if (answer.status === "fulfilled") runtimes.push(answer.value);
+      else errors.push(`${urls[index]}：${answer.reason?.message || answer.reason}`);
+    });
+    const loaded = { key, at: Date.now(), runtimes, errors };
+    if (runtimes.length && lxLoading?.promise === promise) lxLoaded = loaded;
+    return loaded;
+  })();
+  lxLoading = { key, promise };
+  try { return await promise; }
+  finally { if (lxLoading?.promise === promise) lxLoading = null; }
+}
+
+async function lxStream(id, quality) {
+  const { runtimes, errors } = await loadedLx();
+  if (!runtimes.length) throw new Error(errors.join("；") || "没有配置可用的洛雪音源");
+  const musicInfo = lxTracks.get(String(id)) || { source: "wy", id: String(id), songmid: String(id), songId: String(id) };
+  const attempts = runtimes.map(runtime => {
+    const controller = new AbortController();
+    let source;
+    const cancel = () => { controller.abort(); source?.cancel(); };
+    const promise = lxDeadline(async () => {
+      // Overlapping plays get separate script state and request cancellation.
+      source = runtime.busy ? await compileLx(runtime.code) : runtime;
+      if (controller.signal.aborted) { source.cancel(); throw new Error("音源请求已取消"); }
+      source.busy = true;
+      return resolveLx(source, musicInfo, quality, runtimes.length > 1, controller.signal);
+    }, 10000, cancel, controller.signal).finally(() => {
+      if (source) { source.cancel(); source.busy = false; }
+    });
+    return { promise, cancel };
+  });
+  try {
+    return await Promise.any(attempts.map(attempt => attempt.promise));
+  } catch (error) {
+    throw new Error([...errors, ...(error.errors || [error]).map(e => e.message)].join("；"));
+  } finally {
+    for (const attempt of attempts) attempt.cancel();
+  }
+}
+
+async function resolveLx(source, musicInfo, quality, verify, signal) {
+  const declared = source.entry.qualitys || ["128k"];
+  const choices = (lxQualities[quality] || lxQualities.standard).filter(type => declared.includes(type));
+  if (!choices.length) choices.push(declared[0] || "128k");
+  let lastError;
+  for (const type of choices) {
+    const handlers = source.handlers.length ? source.handlers : [({ info }) => source.entry.musicUrl(info.musicInfo, info.type)];
+    for (const handler of handlers) {
+      if (signal.aborted) throw new Error("音源请求已取消");
+      try {
+        const answer = await handler({ source: "wy", action: "musicUrl", info: { type, musicInfo } });
+        const raw = typeof answer === "string" ? answer : answer?.url || answer?.data;
+        if (typeof raw !== "string" || !/^https?:$/.test(new URL(raw).protocol)) throw new Error("音源没有返回 HTTP(S) 播放地址");
+        const requestHeaders = answer?.headers && typeof answer.headers === "object" ? answer.headers : undefined;
+        if (verify) {
+          const response = await lxDeadline(() => fetch(raw, { method: "HEAD", headers: requestHeaders, signal }), 2500, () => {}, signal);
+          if (response.status === 404 || response.status === 410 || response.status >= 500) throw new Error(`播放地址不可用（HTTP ${response.status}）`);
+        }
+        const format = /\.(mp3|flac|m4a|aac|ogg|wav)$/i.exec(new URL(raw).pathname)?.[1].toLowerCase();
+        return {
+          url: raw, type: format || (/flac|hires/.test(type) ? "flac" : "mp3"),
+          quality: /flac|hires/.test(type) ? "lossless" : type === "320k" ? "high" : "standard",
+          ...(requestHeaders ? { headers: requestHeaders } : {}),
+        };
+      } catch (error) { lastError = error; }
+    }
+  }
+  throw lastError || new Error("音源没有返回播放地址");
 }
 
 // Making and keeping playlists, saving albums, following artists: the half of

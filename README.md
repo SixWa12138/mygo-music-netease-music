@@ -73,7 +73,7 @@ Uploads preserve the original bytes, show per-file progress, support cancellatio
 
 ## Sound
 
-Playback addresses come from `interfacepc.music.163.com/eapi/song/enhance/player/url/v1`, the same official client API used by [sogud/mygo-music-netease](https://github.com/sogud/mygo-music-netease). No separate API service is needed. A track plays from the returned NetEase CDN address, with nothing converted: mp3 or flac as it is.
+By default, playback addresses come from `interfacepc.music.163.com/eapi/song/enhance/player/url/v1`, the same official client API used by [sogud/mygo-music-netease](https://github.com/sogud/mygo-music-netease). No separate API service is needed. A track plays from the returned NetEase CDN address, with nothing converted: mp3 or flac as it is.
 
 - standard: 128 kbps
 - high: 320 kbps
@@ -82,6 +82,14 @@ Playback addresses come from `interfacepc.music.163.com/eapi/song/enhance/player
 Signed out, or without membership, a VIP track comes back as a 45-second fragment. That's the service's own doing, not the plugin cutting it off.
 
 If the primary playback endpoint fails or returns no playable address, the plugin tries the same official client's `/eapi/song/enhance/player/url` endpoint. Public catalog restrictions do not grey out your uploaded cloud copy; its audio quality depends on the file NetEase returns.
+
+## Optional LX source fallback
+
+In **Settings > Plugins > 网易云音乐**, the five **洛雪音源地址** fields accept direct `.js` download URLs for LX Music custom source scripts that support NetEase Cloud Music. Fill in one URL per field, then click outside the field to save. Empty fields are ignored; leaving all five empty disables the fallback. This feature needs no player patch. After updating the plugin, restart MyGo Music once to load the new settings; later address changes take effect on the next playback request without restarting.
+
+NetEase playback is always tried first. If its playback endpoints fail or return no playable address for a song, the configured sources are asked in parallel, and the first successful result supplies the playback address. Duplicate URLs are deduplicated. A preview returned by NetEase still plays as a preview and does not trigger the fallback.
+
+With a source configured, songs previously shown greyed out become selectable and get an `[外部音源]` marker. The marker means external fallback is enabled; playback still depends on the source and song. Only load scripts you trust.
 
 ## Lyrics
 
@@ -116,9 +124,9 @@ No build or dependency installation is needed. With Node.js 22 or newer, run `no
 
 **Trademarks.** "NetEase Cloud Music", "网易云音乐" and the related names, logos, icons and interface designs are trademarks and/or copyrighted works of NetEase or their respective owners. Their use here is nominative, to refer to the service, and claims no rights. This repository claims no copyright in the third-party assets visible in the screenshot.
 
-**Content.** All music, audio, lyrics, translations, cover art, artist images, comments and other content reached through this plugin belong to NetEase Cloud Music and the respective rights holders — labels, songwriters, performers and others. Apart from the interface screenshot, this repository does not store, host, mirror or distribute any of it. The plugin runs on your own computer, with your own account, asks NetEase's own API for data, and hands the playback address the service returns to the player. The screenshot illustrates the interface; no audio or lyrics are shipped with this repository.
+**Content.** All music, audio, lyrics, translations, cover art, artist images, comments and other content reached through this plugin belong to the respective rights holders — labels, songwriters, performers and others. Apart from the interface screenshot, this repository does not store, host, mirror or distribute any of it. The plugin runs on your own computer, with your own account, asks NetEase's own API for data, and hands playback addresses returned by NetEase or your configured external sources to the player. The screenshot illustrates the interface; no audio or lyrics are shipped with this repository.
 
-**No circumvention.** The plugin does not offer, and does not attempt, cracking, ad removal, bypassing payment, membership or regional restrictions, bulk downloading, or exporting audio or lyrics. Whether a track plays, at what bitrate, and for how long as a preview is decided entirely by NetEase's servers from your account and region; the plugin only passes on what the service answers.
+**Playback permissions.** The plugin does not change your NetEase account's membership or payment permissions, and does not provide cracking, ad removal, bulk downloading, or exporting audio or lyrics. NetEase decides native playback availability, bitrate and preview length. When external sources are enabled, availability and access depend on the corresponding service. Only use scripts and content you have permission to access.
 
 **Scope of use.** For personal study, research and private use only. Do not use the plugin, or a modified version of it, commercially, as a public service, for bulk scraping, for hoarding data, for redistribution, or in any way that breaks NetEase's terms of service or the laws where you live. You are responsible for what you do with it.
 

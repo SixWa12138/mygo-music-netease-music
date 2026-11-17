@@ -6,9 +6,10 @@ import test from "node:test";
 const manifest = JSON.parse(await readFile(new URL("./plugin.json", import.meta.url), "utf8"));
 let sequence = 0;
 
-async function setup(handler, signedIn = true) {
+async function setup(handler, signedIn = true, settings = {}) {
   const storage = new Map(signedIn ? [["cookie", "MUSIC_U=test-session; __csrf=test-csrf; NMTID=test-device"]] : []);
   globalThis.host = {
+    setting: key => settings[key] || "",
     storage: { get: key => storage.get(key), set: (key, value) => storage.set(key, value), remove: key => storage.delete(key) },
     crypto: {
       md5: text => createHash("md5").update(text).digest("hex"),
@@ -20,7 +21,7 @@ async function setup(handler, signedIn = true) {
   };
   globalThis.fetch = async (url, init) => {
     const address = new URL(url);
-    assert.ok(manifest.permissions.network.some(pattern => pattern === address.hostname || (pattern.startsWith("*.") && address.hostname.endsWith(pattern.slice(1)))), `Missing network permission for ${address.hostname}`);
+    assert.ok(manifest.permissions.network.some(pattern => pattern === "*" || pattern === address.hostname || (pattern.startsWith("*.") && address.hostname.endsWith(pattern.slice(1)))), `Missing network permission for ${address.hostname}`);
     const body = await handler(address, init);
     if (body instanceof Response) return body;
     return { ok: true, status: 200, json: async () => body };
@@ -707,6 +708,246 @@ test("audio fallback preserves authentication and service failures", async () =>
     return url.pathname.endsWith("/v1") ? { code: 405, message: "当前环境异常" } : { code: 200, data: [] };
   });
   await assert.rejects(failed.stream({ id: "42", quality: "high" }), /当前环境异常/);
+});
+
+const lxFixture = (body, qualitys = ["128k", "320k", "flac"]) => `
+/** @name Test source */
+lx.on(lx.EVENT_NAMES.request, async ({ source, action, info }) => {
+  if (source !== "wy" || action !== "musicUrl") throw new Error("wrong LX request");
+  ${body}
+});
+lx.send(lx.EVENT_NAMES.inited, { sources: { wy: { type: "music", actions: ["musicUrl"], qualitys: ${JSON.stringify(qualitys)} } } });
+`;
+
+const noAudio = (url, init) => {
+  request(url, init);
+  return { code: 200, data: [] };
+};
+
+const setupLx = (handler, script) => setup((url, init) => {
+  if (url.href === "https://source.invalid/test.js") return new Response(script);
+  return handler(url, init);
+}, true, { scriptUrls: "https://source.invalid/test.js" });
+
+// Configuring a source makes restricted catalog entries clickable without downloading scripts during browsing.
+test("LX settings unlock and label restricted songs, and clearing them restores catalog restrictions", async t => {
+  assert.equal(manifest.settings.length, 5);
+  for (const { key } of manifest.settings) {
+    await t.test(key, async () => {
+      const settings = { [key]: "https://source.invalid/source.js" };
+      const restricted = { ...song(42), st: -1 };
+      const plugin = await setup((url, init) => {
+        if (url.hostname === "source.invalid") return new Response(lxFixture(`return "https://audio.invalid/${key}.mp3";`));
+        if (url.pathname === "/api/cloudsearch/pc") return { code: 200, result: { songs: [restricted, { ...restricted, id: 43, pc: {} }, song(44)] } };
+        return noAudio(url, init);
+      }, true, settings);
+      const result = await plugin.search({ query: "song", kind: "tracks", offset: 0 });
+      assert.equal(result.tracks[0].id, "42");
+      assert.equal(result.tracks[0].name, "Song 42 [外部音源]");
+      assert.ok(!result.tracks[0].unavailable);
+      assert.equal(result.tracks[1].name, "Song 42");
+      assert.equal(result.tracks[2].name, "Song 44");
+      assert.equal((await plugin.stream({ id: "42", quality: "high" })).url, `https://audio.invalid/${key}.mp3`);
+      settings.script = lxFixture(`return "https://audio.invalid/legacy.mp3";`);
+      settings[key] = "\n  \r\n";
+      plugin.setSetting({ key });
+      const cleared = await plugin.search({ query: "song", kind: "tracks", offset: 0 });
+      assert.equal(cleared.tracks[0].unavailable, true);
+      assert.equal(cleared.tracks[0].name, "Song 42");
+    });
+  }
+});
+
+// An optional source must not interfere with official playback, including guest previews.
+test("configured LX sources stay idle when NetEase returns audio", async () => {
+  const plugin = await setup((url, init) => {
+    request(url, init);
+    return { code: 200, data: [audio()] };
+  }, true, { scriptUrls: "https://source.invalid/unreachable.js" });
+  assert.equal((await plugin.stream({ id: "42", quality: "high" })).url, "https://m1.music.126.net/song");
+});
+
+// The exact NetEase ID and unmodified song metadata must reach the source, even when the display name has a marker.
+test("LX receives NetEase song metadata and falls back through supported qualities", async () => {
+  const script = lxFixture(`
+    if (info.musicInfo.songmid !== "42" || info.musicInfo.name !== "Song 42" || info.musicInfo.singer !== "Artist") throw new Error("wrong metadata");
+    if (info.type === "flac") throw new Error("lossless missing");
+    if (info.type !== "320k") throw new Error("wrong quality");
+    return { url: "http://audio.invalid/song.m4a?token=abc", headers: { Referer: "https://source.invalid/" } };
+  `);
+  const plugin = await setupLx((url, init) => {
+    if (url.pathname === "/api/cloudsearch/pc") return { code: 200, result: { songs: [{ ...song(42), st: -1, ar: [{ id: 1, name: "Artist" }] }] } };
+    return noAudio(url, init);
+  }, script);
+  await plugin.search({ query: "song", kind: "tracks", offset: 0 });
+  assert.deepEqual(await plugin.stream({ id: "42", quality: "lossless" }), {
+    url: "http://audio.invalid/song.m4a?token=abc", type: "m4a", quality: "high", headers: { Referer: "https://source.invalid/" },
+  });
+});
+
+// Newline-separated scripts load independently; the winner cancels the slower source and never receives account cookies.
+test("multiple LX URLs race, deduplicate, cache downloads, and cancel losing requests", async () => {
+  const downloads = [];
+  let cancelled = 0;
+  let slowStarted = 0;
+  const plugin = await setup((url, init) => {
+    if (url.hostname.endsWith("music.163.com")) return noAudio(url, init);
+    const sent = new Headers(init.headers);
+    assert.equal(sent.get("cookie"), null);
+    assert.ok(!JSON.stringify([...sent]).includes("test-session"));
+    if (url.pathname === "/broken.js") { downloads.push(url.href); return new Response("syntax error!"); }
+    if (url.pathname === "/slow.js") {
+      downloads.push(url.href);
+      return new Response(lxFixture(`return new Promise((resolve, reject) => lx.request("https://source.invalid/slow", {}, (error, response) => error ? reject(error) : resolve(response.body.url)));`));
+    }
+    if (url.pathname === "/fast.js") {
+      downloads.push(url.href);
+      assert.equal(url.searchParams.get("token"), "a,b;c");
+      return new Response(lxFixture(`return new Promise((resolve, reject) => lx.request("https://source.invalid/fast", { method: "POST", form: { id: info.musicInfo.songmid, quality: info.type } }, (error, response, body) => error ? reject(error) : resolve(body.url)));`, ["128k"]));
+    }
+    if (url.pathname === "/slow") {
+      slowStarted++;
+      return new Promise((_, reject) => init.signal.addEventListener("abort", () => { cancelled++; reject(new Error("aborted")); }, { once: true }));
+    }
+    if (url.pathname === "/fast") {
+      assert.equal(slowStarted, cancelled + 1);
+      assert.equal(init.method, "POST");
+      assert.equal(sent.get("content-type"), "application/x-www-form-urlencoded");
+      assert.equal(new URLSearchParams(init.body).get("id"), "42");
+      assert.equal(new URLSearchParams(init.body).get("quality"), "128k");
+      return new Response(JSON.stringify({ url: "http://audio.invalid/play.mp3" }));
+    }
+    assert.equal(url.href, "http://audio.invalid/play.mp3");
+    assert.equal(init.method, "HEAD");
+    return new Response(null, { status: 200 });
+  }, true, {
+    scriptUrls: "\r\n https://source.invalid/broken.js \r\nhttps://source.invalid/slow.js ",
+    scriptUrl2: "https://source.invalid/fast.js?token=a,b;c\n",
+    scriptUrl3: "https://source.invalid/fast.js?token=a,b;c",
+    scriptUrl4: "  ",
+    scriptUrl5: " https://source.invalid/slow.js\n",
+  });
+  for (let i = 0; i < 2; i++) {
+    assert.deepEqual(await plugin.stream({ id: "42", quality: "lossless" }), { url: "http://audio.invalid/play.mp3", type: "mp3", quality: "standard" });
+    assert.equal(cancelled, i + 1);
+  }
+  assert.equal(downloads.length, 3);
+});
+
+// A completed newer play must not cancel another song still resolving in the same source script.
+test("overlapping LX plays keep their source state and cancellation separate", async () => {
+  const callbacks = new Map();
+  const aborted = [];
+  let started;
+  const nextRequest = () => new Promise(resolve => { started = resolve; });
+  const plugin = await setupLx((url, init) => {
+    if (url.hostname.endsWith("music.163.com")) return noAudio(url, init);
+    const id = url.searchParams.get("id");
+    return new Promise((resolve, reject) => {
+      callbacks.set(id, () => resolve(new Response(JSON.stringify({ url: `https://audio.invalid/${id}.mp3` }))));
+      init.signal.addEventListener("abort", () => { aborted.push(id); reject(new Error("aborted")); }, { once: true });
+      started();
+    });
+  }, lxFixture(`return new Promise((resolve, reject) => lx.request("https://source.invalid/resolve?id=" + info.musicInfo.songmid, {}, (error, response) => error ? reject(error) : resolve(response.body.url)));`));
+  let ready = nextRequest();
+  const first = plugin.stream({ id: "42", quality: "standard" });
+  await ready;
+  ready = nextRequest();
+  const second = plugin.stream({ id: "43", quality: "standard" });
+  await ready;
+  callbacks.get("43")();
+  assert.equal((await second).url, "https://audio.invalid/43.mp3");
+  assert.ok(!aborted.includes("42"));
+  callbacks.get("42")();
+  assert.equal((await first).url, "https://audio.invalid/42.mp3");
+});
+
+// A fast dead link must not prevent another configured source from supplying working audio.
+test("LX skips dead links and tries another configured source", async () => {
+  let deadChecked = false;
+  const plugin = await setup((url, init) => {
+    if (url.hostname.endsWith("music.163.com")) return noAudio(url, init);
+    if (url.pathname === "/source.js") return new Response(lxFixture(`return "https://audio.invalid/dead.mp3";`));
+    if (url.pathname === "/other.js") return new Response(lxFixture(`return "https://audio.invalid/good.flac";`));
+    assert.equal(init.method, "HEAD");
+    if (url.pathname === "/dead.mp3") { deadChecked = true; return new Response(null, { status: 404 }); }
+    assert.equal(url.pathname, "/good.flac");
+    return new Response(null, { status: 405 });
+  }, true, { scriptUrls: "https://source.invalid/source.js\nhttps://source.invalid/other.js" });
+  assert.deepEqual(await plugin.stream({ id: "42", quality: "lossless" }), { url: "https://audio.invalid/good.flac", type: "flac", quality: "lossless" });
+  assert.ok(deadChecked);
+});
+
+// Source changes invalidate compiled code immediately; asynchronous initialization and CommonJS sources both work.
+test("LX supports asynchronous init, CommonJS exports, and changed settings", async t => {
+  for (const key of ["scriptUrls", "scriptUrl5"]) {
+    await t.test(key, async () => {
+      const settings = { [key]: "https://source.invalid/test.js" };
+      let script = `
+    lx.on("request", ({ info }) => "https://audio.invalid/" + info.musicInfo.songmid + ".mp3");
+    setTimeout(() => lx.send("inited", { sources: { wy: { type: "music", qualitys: ["128k"] } } }), 0);
+  `;
+      const plugin = await setup((url, init) => url.href === settings[key].trim() ? new Response(script) : noAudio(url, init), true, settings);
+      assert.equal((await plugin.stream({ id: "42", quality: "high" })).url, "https://audio.invalid/42.mp3");
+      script = `module.exports = { sources: { wy: { qualitys: ["flac"], musicUrl: (song, type) => "https://audio.invalid/" + song.songmid + "." + type } } };`;
+      settings[key] += "\n";
+      plugin.setSetting({ key });
+      assert.deepEqual(await plugin.stream({ id: "42", quality: "lossless" }), { url: "https://audio.invalid/42.flac", type: "flac", quality: "lossless" });
+    });
+  }
+});
+
+// Common scripts use Buffer and crypto bridges to sign their source requests.
+test("LX buffer and crypto bridges work inside source scripts", async () => {
+  const script = `const { Buffer } = require("buffer"); const lx = globalThis.lx;\n` + lxFixture(`
+    const { Buffer } = require("buffer");
+    const plain = Buffer.from("洛雪🎵");
+    if (Buffer.from(plain.toString("base64"), "base64").toString() !== "洛雪🎵") throw new Error("base64 failed");
+    if (Buffer.from(plain.toString("hex"), "hex").toString() !== "洛雪🎵") throw new Error("hex failed");
+    if (Buffer.concat([Buffer.from("ab"), Buffer.from("cd")], 3).toString() !== "abc") throw new Error("concat failed");
+    if (!Buffer.isBuffer(Buffer.alloc(2))) throw new Error("buffer failed");
+    if (require("crypto").createHash("md5").update(Buffer.from("abc")).digest("hex") !== "900150983cd24fb0d6963f7d28e17f72") throw new Error("md5 failed");
+    if (lx.utils.crypto.aesEncrypt(Buffer.from("abc"), "aes-128-ecb", "e82ckenh8dichen8").toString("hex") !== "${(() => { const cipher = createCipheriv("aes-128-ecb", "e82ckenh8dichen8", null); return Buffer.concat([cipher.update("abc"), cipher.final()]).toString("hex"); })()}") throw new Error("AES failed");
+    if (lx.utils.crypto.randomBytes(16).length !== 16) throw new Error("random failed");
+    if (host !== undefined || globalThis.host !== undefined) throw new Error("host exposed directly");
+    return "https://audio.invalid/song.mp3";
+  `);
+  const plugin = await setupLx(noAudio, script);
+  assert.equal((await plugin.stream({ id: "42", quality: "standard" })).url, "https://audio.invalid/song.mp3");
+});
+
+// All failures must name the source problem rather than return invalid URLs or silence an official API error.
+test("LX rejects unsupported sources and invalid URLs, preserving native failures", async () => {
+  for (const [script, message] of [
+    ["module.exports = { sources: { tx: {} } };", /不支持获取网易云歌曲的播放地址/],
+    [lxFixture(`return "file:///tmp/audio.mp3";`), /HTTP\(S\)/],
+    [lxFixture(`require("crypto").createHash("sha256");`), /sha256/],
+    [lxFixture(`throw new Error("source unavailable");`), /source unavailable/],
+  ]) {
+    const plugin = await setupLx((url, init) => {
+      request(url, init);
+      return { code: 405, message: "native failure" };
+    }, script);
+    await assert.rejects(plugin.stream({ id: "42", quality: "high" }), error => {
+      assert.equal(error.code, "unavailable");
+      assert.match(error.message, /native failure/);
+      assert.match(error.message, message);
+      return true;
+    });
+  }
+});
+
+// A hung source must time out and abort its HTTP request.
+test("LX bounds stalled playback requests", async t => {
+  const setTimer = globalThis.setTimeout;
+  t.mock.method(globalThis, "setTimeout", (fn, ms, ...args) => setTimer(fn, Math.min(ms, 10), ...args));
+  let aborted = false;
+  const plugin = await setupLx((url, init) => {
+    if (url.hostname.endsWith("music.163.com")) return noAudio(url, init);
+    return new Promise((_, reject) => init.signal.addEventListener("abort", () => { aborted = true; reject(new Error("aborted")); }, { once: true }));
+  }, lxFixture(`return new Promise((resolve, reject) => lx.request("https://source.invalid/stalled", {}, (error, response) => error ? reject(error) : resolve(response.body)));`));
+  await assert.rejects(plugin.stream({ id: "42", quality: "standard" }), /超时/);
+  assert.ok(aborted);
 });
 
 const radio = { id: 8, name: "Podcast", picUrl: "http://p1.music.126.net/cover.jpg", programCount: 2, dj: { nickname: "Host" } };

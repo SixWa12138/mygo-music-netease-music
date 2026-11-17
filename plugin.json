@@ -1,12 +1,35 @@
 {
   "id": "netease-music",
   "name": "网易云音乐",
-  "version": "0.4.1",
+  "version": "0.5.2",
   "main": "index.js",
   "playback": "stream",
   "permissions": {
-    "network": ["music.163.com", "interfacepc.music.163.com", "*.127.net"]
+    "network": ["*"]
   },
+  "settings": [
+    {
+      "key": "scriptUrls",
+      "label": "洛雪音源地址 1（可选）",
+      "help": "填写支持网易云音乐的洛雪音源 .js 下载地址，每个输入框填一个。填写后点击框外保存；网易云无法播放时自动尝试，全部留空关闭。"
+    },
+    {
+      "key": "scriptUrl2",
+      "label": "洛雪音源地址 2（可选）"
+    },
+    {
+      "key": "scriptUrl3",
+      "label": "洛雪音源地址 3（可选）"
+    },
+    {
+      "key": "scriptUrl4",
+      "label": "洛雪音源地址 4（可选）"
+    },
+    {
+      "key": "scriptUrl5",
+      "label": "洛雪音源地址 5（可选）"
+    }
+  ],
   "navigation": [
     {
       "builtin": "home"
