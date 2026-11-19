@@ -1667,13 +1667,18 @@ async function resolveLx(source, musicInfo, quality, verify, signal) {
       try {
         const answer = await handler({ source: "wy", action: "musicUrl", info: { type, musicInfo } });
         const raw = typeof answer === "string" ? answer : answer?.url || answer?.data;
-        if (typeof raw !== "string" || !/^https?:$/.test(new URL(raw).protocol)) throw new Error("音源没有返回 HTTP(S) 播放地址");
+        const address = typeof raw === "string" ? new URL(raw) : null;
+        if (!address || !/^https?:$/.test(address.protocol)) throw new Error("音源没有返回 HTTP(S) 播放地址");
+        if (/(^|\.)music\.163\.com$/.test(address.hostname) && /^\/song\/media\/outer\/url\/?$/.test(address.pathname)) {
+          const returnedId = (address.searchParams.get("id") || "").replace(/\.mp3$/i, "");
+          if (returnedId !== musicInfo.songmid) throw new Error(`音源返回的网易云歌曲 ID 不一致（请求 ${musicInfo.songmid}，返回 ${returnedId || "缺失"}）`);
+        }
         const requestHeaders = answer?.headers && typeof answer.headers === "object" ? answer.headers : undefined;
         if (verify) {
           const response = await lxDeadline(() => fetch(raw, { method: "HEAD", headers: requestHeaders, signal }), 2500, () => {}, signal);
           if (response.status === 404 || response.status === 410 || response.status >= 500) throw new Error(`播放地址不可用（HTTP ${response.status}）`);
         }
-        const format = /\.(mp3|flac|m4a|aac|ogg|wav)$/i.exec(new URL(raw).pathname)?.[1].toLowerCase();
+        const format = /\.(mp3|flac|m4a|aac|ogg|wav)$/i.exec(address.pathname)?.[1].toLowerCase();
         return {
           url: raw, type: format || (/flac|hires/.test(type) ? "flac" : "mp3"),
           quality: /flac|hires/.test(type) ? "lossless" : type === "320k" ? "high" : "standard",

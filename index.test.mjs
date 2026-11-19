@@ -862,6 +862,38 @@ test("overlapping LX plays keep their source state and cancellation separate", a
   assert.equal((await first).url, "https://audio.invalid/42.mp3");
 });
 
+// An external API returned a playable NetEase URL for an entirely different song.
+test("LX rejects mismatched or missing NetEase song IDs even with a single source", async () => {
+  for (const returnedId of ["385382", "385382.mp3", ""]) {
+    let checked = false;
+    const plugin = await setupLx((url, init) => {
+      if (init.method === "HEAD") { checked = true; return new Response(null, { status: 200 }); }
+      return noAudio(url, init);
+    }, lxFixture(`return "https://music.163.com/song/media/outer/url?id=${returnedId}";`));
+    await assert.rejects(plugin.stream({ id: "1309903366", quality: "standard" }), error => {
+      assert.equal(error.code, "unavailable");
+      assert.match(error.message, /歌曲 ID 不一致.*1309903366/);
+      assert.ok(error.message.includes(returnedId.replace(/\.mp3$/, "") || "缺失"));
+      return true;
+    });
+    assert.equal(checked, false, "Reject the wrong song before checking whether its URL plays");
+  }
+});
+
+// A fast wrong song must not win the race against a source returning the requested NetEase ID.
+test("LX skips a different NetEase song and accepts the matching ID from another source", async () => {
+  const checked = [];
+  const plugin = await setup((url, init) => {
+    if (init.method === "HEAD") { checked.push(url.href); return new Response(null, { status: 200 }); }
+    if (url.pathname === "/wrong.js") return new Response(lxFixture(`return "https://music.163.com/song/media/outer/url?id=385382.mp3";`));
+    if (url.pathname === "/correct.js") return new Response(lxFixture(`return "https://music.163.com/song/media/outer/url?id=" + info.musicInfo.songmid + ".mp3";`));
+    return noAudio(url, init);
+  }, true, { scriptUrls: "https://source.invalid/wrong.js https://source.invalid/correct.js" });
+  const result = await plugin.stream({ id: "1309903366", quality: "standard" });
+  assert.equal(result.url, "https://music.163.com/song/media/outer/url?id=1309903366.mp3");
+  assert.deepEqual(checked, [result.url]);
+});
+
 // A fast dead link must not prevent another configured source from supplying working audio.
 test("LX skips dead links and tries another configured source", async () => {
   let deadChecked = false;
